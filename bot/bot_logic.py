@@ -142,3 +142,25 @@ def save_checklist_with_answers(user_id: int, checklist_id: int, answers: list[d
                 created_at=datetime.utcnow()
             ))
         db.commit()
+
+from checklist.models import ChecklistAnswer, ChecklistQuestion, Checklist
+
+def get_completed_checklists_for_user(user_id: int):
+    with SessionLocal() as db:
+        results = (
+            db.query(Checklist.name, ChecklistAnswer.created_at)
+            .join(ChecklistQuestion, ChecklistQuestion.id == ChecklistAnswer.question_id)
+            .join(Checklist, Checklist.id == ChecklistQuestion.checklist_id)
+            .filter(ChecklistAnswer.user_id == user_id)
+            .order_by(ChecklistAnswer.created_at.desc())
+            .all()
+        )
+
+        # Оставим только уникальные чек-листы по последнему прохождению
+        seen = {}
+        for name, created_at in results:
+            if name not in seen:
+                seen[name] = created_at
+
+        return [{"name": name, "completed_at": seen[name]} for name in seen]
+

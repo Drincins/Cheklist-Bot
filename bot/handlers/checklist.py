@@ -232,6 +232,13 @@ async def handle_show_details(callback: types.CallbackQuery, state: FSMContext):
     for q, a in zip(questions, answers):
         text += f"— {q['text']}: *{a['answer']}*\n"
     await callback.message.answer(text, parse_mode="Markdown")
+
+    # 🔁 Добавим повтор кнопки "Далее"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Далее", callback_data="checklist_continue")]
+    ])
+    await callback.message.answer("Что дальше?", reply_markup=keyboard)
+
     await callback.answer()
 
 @router.callback_query(F.data == "show_answers")
@@ -247,12 +254,11 @@ async def handle_show_answers(callback: types.CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "checklist_continue")
 async def handle_continue(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    checklists = get_checklists_for_user(data["user_id"])
-    if checklists:
-        await callback.message.answer("Выберите чек-лист для прохождения:", reply_markup=get_checklists_keyboard(checklists))
-        await state.set_state(Form.show_checklists)
-    else:
-        await callback.message.answer("Нет доступных чек-листов.")
-        await state.clear()
+    from keyboards.reply import authorized_keyboard
+    await callback.message.answer(
+        "📋 Главное меню:",
+        reply_markup=authorized_keyboard
+    )
     await callback.answer()
+
+
