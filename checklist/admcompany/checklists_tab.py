@@ -1,6 +1,6 @@
 import streamlit as st
 from checklist.db import SessionLocal
-from checklist.models import Checklist, ChecklistQuestion
+from checklist.models import Checklist, ChecklistQuestion, Position
 from sqlalchemy.exc import IntegrityError
 
 def checklists_tab(company_id):
@@ -67,6 +67,7 @@ def checklists_tab(company_id):
             new_name = st.text_input("Название чек-листа", value=selected_cl.name)
             is_scored = st.checkbox("Оцениваемый чек-лист?", value=selected_cl.is_scored)
             save_cl = st.form_submit_button("💾 Сохранить изменения чек-листа")
+           
             if save_cl:
                 selected_cl.name = new_name
                 selected_cl.is_scored = is_scored
@@ -78,6 +79,41 @@ def checklists_tab(company_id):
                     db.rollback()
                     st.error("Ошибка при сохранении изменений")
                     st.exception(e)
+                st.markdown("### 🧑‍💼 Назначение чек-листа должностям")
+
+        # Загружаем все должности компании
+        all_positions = db.query(Position).filter_by(company_id=company_id).all()
+
+        if all_positions:
+            # Получаем ID уже связанных должностей
+            current_ids = [pos.id for pos in selected_cl.positions]
+
+            # Маппинг название → id
+            pos_options = {p.name: p.id for p in all_positions}
+
+            # Мультиселект
+            selected_names = st.multiselect(
+                "Выберите должности, которым доступен этот чек-лист",
+                options=list(pos_options.keys()),
+                default=[p.name for p in all_positions if p.id in current_ids],
+                key="checklist_position_bind"
+            )
+
+            selected_ids = [pos_options[name] for name in selected_names]
+
+            if st.button("💾 Сохранить назначения"):
+                try:
+                    # Обновляем связи через backref
+                    selected_cl.positions = [p for p in all_positions if p.id in selected_ids]
+                    db.commit()
+                    st.success("Привязка должностей сохранена.")
+                    st.rerun()
+                except IntegrityError as e:
+                    db.rollback()
+                    st.error("Ошибка при сохранении назначений")
+                    st.exception(e)
+        else:
+            st.info("Нет доступных должностей в этой компании.")
 
         st.markdown("---")
         st.markdown("### Вопросы чек-листа")

@@ -1,6 +1,6 @@
 import streamlit as st
 from checklist.db import SessionLocal
-from checklist.models import Checklist, ChecklistQuestion
+from checklist.models import Checklist, ChecklistQuestion,Position
 from sqlalchemy.exc import IntegrityError
 
 def add_checklist_tab(company_id):
@@ -33,7 +33,8 @@ def add_checklist_tab(company_id):
                 st.session_state.cl_form = {
                     "name": "",
                     "is_scored": False,
-                    "questions": []
+                    "questions": [],
+                    "positions": []
                 }
                 st.session_state.cl_step = 1
 
@@ -66,6 +67,25 @@ def add_checklist_tab(company_id):
                         "weight": int(q_weight) if q_weight else None
                     })
                     st.rerun()
+             # === Привязка чек-листа к должностям ===
+        st.markdown("### 👥 Назначить чек-лист должностям")
+
+        all_positions = db.query(Position).filter_by(company_id=company_id).all()
+        if all_positions:
+            pos_options = {p.name: p.id for p in all_positions}
+
+            selected_pos_names = st.multiselect(
+                "Выберите должности",
+                options=list(pos_options.keys()),
+                default=[
+                    name for name in pos_options.keys()
+                    if pos_options[name] in st.session_state.cl_form.get("positions", [])
+                ],
+                key="create_pos_multiselect"
+            )
+            st.session_state.cl_form["positions"] = [pos_options[name] for name in selected_pos_names]
+        else:
+            st.info("В компании пока нет должностей. Вы можете назначить их позже.")
 
         if st.session_state.cl_form["questions"]:
             st.markdown("#### Вопросы чек-листа:")
@@ -92,12 +112,19 @@ def add_checklist_tab(company_id):
                         if existing_cl:
                             st.warning("Такой чек-лист уже существует.")
                         else:
+                            # Получаем объекты должностей
+                            assigned_positions = db.query(Position).filter(Position.id.in_(
+                                st.session_state.cl_form["positions"]
+                            )).all()
+
                             new_cl = Checklist(
                                 name=st.session_state.cl_form["name"],
                                 is_scored=st.session_state.cl_form["is_scored"],
                                 company_id=company_id,
-                                created_by=1,
+                                created_by=1,  # TODO: заменить на текущего пользователя
+                                positions=assigned_positions  # <-- Сразу назначаем
                             )
+
                             db.add(new_cl)
                             db.commit()
                             q_type_map = {
@@ -119,7 +146,7 @@ def add_checklist_tab(company_id):
                                 )
                             db.commit()
                             st.success("Чек-лист и вопросы успешно сохранены!")
-                            st.session_state.cl_form = {"name": "", "is_scored": False, "questions": []}
+                            st.session_state.cl_form = {"name": "", "is_scored": False, "questions": [],"positions": []}
                             st.session_state.cl_step = 1
                             st.rerun()
                     except IntegrityError as e:

@@ -48,9 +48,7 @@ def reports_tab(company_id=None):
         st.rerun()
 
     db = SessionLocal()
-    st.write("DB URL:", db.bind.url)
     answers = db.query(ChecklistAnswer).order_by(ChecklistAnswer.submitted_at.desc()).all()
-    st.write("answers found:", len(answers))
 
     if not answers:
         st.info("Нет ни одного ответа по чек‑листам в базе.")

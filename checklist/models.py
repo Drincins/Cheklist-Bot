@@ -53,6 +53,7 @@ class User(Base):
     telegram_id = Column(Integer, unique=True, nullable=True)
     phone = Column(String, nullable=True)
     role = Column(Enum("employee", "senior_admin", "main_admin", name="user_roles"), nullable=False)
+    department = Column(String, nullable=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
     position_id = Column(Integer, ForeignKey("positions.id"), nullable=True)
     login = Column(String, unique=True, nullable=True)

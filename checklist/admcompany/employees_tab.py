@@ -1,83 +1,85 @@
 import streamlit as st
 from checklist.db import SessionLocal
-from checklist.models import User, Position, Checklist 
+from checklist.models import User, Position
 from sqlalchemy.exc import IntegrityError
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+import pandas as pd
 
 def employees_tab(company_id):
     db = SessionLocal()
     st.subheader("Сотрудники и должности")
-    
-    sub_tabs = st.tabs(["Сотрудники", "Должности"])
-    
-    with sub_tabs[0]:
 
+    sub_tabs = st.tabs(["Сотрудники", "Должности"])
+
+    # ——— Вкладка 1: Сотрудники
+    with sub_tabs[0]:
         st.subheader("Список сотрудников")
         users = db.query(User).filter_by(company_id=company_id, role="employee").all()
-
-        # Подгружаем справочник должностей для компании
         positions = db.query(Position).filter_by(company_id=company_id).all()
-        # Если нет ни одной должности — подсказываем добавить
-        if not positions:
-            st.warning("Сначала добавьте должности в разделе справочников!")
-            db.close()
-            return
+
         position_options = {p.name: p.id for p in positions}
 
         if users:
+            # Готовим данные
+            position_map = {p.id: p.name for p in positions}
+            position_name_to_id = {v: k for k, v in position_map.items()}
+
+            data = []
             for user in users:
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    # Находим название должности по id (или пишем "Не указана")
-                    pos_name = next((p.name for p in positions if p.id == user.position_id), "Не указана")
-                    st.write(f"👤 {user.name} ({user.phone}) — {pos_name}")
-                with col2:
-                    edit_btn = st.button("✏️ Редактировать", key=f"edit_{user.id}")
+                data.append({
+                    "ID": user.id,
+                    "ФИО": user.name,
+                    "Телефон": user.phone or "",
+                    "Подразделение": user.department or "",
+                    "Должность": position_map.get(user.position_id, "Не указана")
+                })
 
-                if st.session_state.get(f"edit_mode_{user.id}", False) or edit_btn:
-                    st.session_state[f"edit_mode_{user.id}"] = True
-                    with st.expander(f"Редактирование — {user.name}", expanded=True):
-                        new_name = st.text_input("ФИО", value=user.name, key=f"name_{user.id}")
-                        new_phone = st.text_input("Телефон (+7...)", value=user.phone or "", key=f"phone_{user.id}")
+            df = pd.DataFrame(data)
 
-                        # ВЫПАДАЮЩИЙ СПРАВОЧНИК ДОЛЖНОСТЕЙ
-                        pos_names = list(position_options.keys())
-                        pos_ids = list(position_options.values())
-                        # Для корректного отображения текущей должности:
-                        curr_idx = pos_ids.index(user.position_id) if user.position_id in pos_ids else 0
-                        selected_pos_name = st.selectbox(
-                            "Должность",
-                            options=pos_names,
-                            index=curr_idx,
-                            key=f"pos_{user.id}"
-                        )
-                        position_id = position_options[selected_pos_name]
+            # Настройки таблицы
+            gb = GridOptionsBuilder.from_dataframe(df)
+            gb.configure_pagination()
+            gb.configure_default_column(editable=True)
+            gb.configure_column("ID", editable=False, hide=True)
+            gb.configure_selection("multiple", use_checkbox=False)
+            grid_options = gb.build()
 
-                        save = st.button("💾 Сохранить", key=f"save_{user.id}")
-                        cancel = st.button("❌ Отмена", key=f"cancel_{user.id}")
+            # Отображаем таблицу
+            grid_response = AgGrid(
+                df,
+                gridOptions=grid_options,
+                update_mode=GridUpdateMode.VALUE_CHANGED,
+                allow_unsafe_jscode=True,
+                theme="streamlit",
+                height=500
+            )
 
-                        if save:
-                            user.name = new_name
-                            user.phone = new_phone
-                            user.position_id = position_id
-                            try:
-                                db.commit()
-                                st.success("Изменения сохранены")
-                                st.session_state[f"edit_mode_{user.id}"] = False
-                                st.rerun()
-                            except IntegrityError as e:
-                                db.rollback()
-                                st.error("Ошибка при обновлении")
-                                st.exception(e)
-                        if cancel:
-                            st.session_state[f"edit_mode_{user.id}"] = False
-                            st.rerun()
+            edited_rows = grid_response["data"]
+
+            if st.button("💾 Сохранить изменения"):
+                try:
+                    for row in edited_rows.to_dict(orient="records"):
+                        user = db.query(User).get(row["ID"])
+                        if user:
+                            user.name = row["ФИО"]
+                            user.phone = row["Телефон"]
+                            user.department = row["Подразделение"]
+                            user.position_id = position_name_to_id.get(row["Должность"], user.position_id)
+                    db.commit()
+                    st.success("Изменения сохранены")
+                    st.rerun()
+                except IntegrityError as e:
+                    db.rollback()
+                    st.error("Ошибка при сохранении")
+                    st.exception(e)
+
         else:
             st.info("Сотрудников пока нет.")
-        # ——— Подвкладка 2 — Должности
+
+    # ——— Вкладка 2: Должности
     with sub_tabs[1]:
-        st.markdown("### Должности компании")
+        st.subheader("Должности компании")
         positions = db.query(Position).filter_by(company_id=company_id).all()
-        checklists = db.query(Checklist).filter_by(company_id=company_id).all()
 
         if positions:
             for pos in positions:
@@ -87,29 +89,14 @@ def employees_tab(company_id):
                 with col2:
                     edit_btn = st.button("✏️ Редактировать", key=f"edit_pos_{pos.id}")
 
-                # Редактирование должности + чек-листы
                 if st.session_state.get(f"edit_mode_pos_{pos.id}", False) or edit_btn:
                     st.session_state[f"edit_mode_pos_{pos.id}"] = True
                     with st.expander(f"Редактирование — {pos.name}", expanded=True):
                         new_name = st.text_input("Название должности", value=pos.name, key=f"pos_name_{pos.id}")
-
-                        # Список чек-листов (названия/id)
-                        checklist_options = {cl.name: cl.id for cl in checklists}
-                        selected_names = st.multiselect(
-                            "Доступные чек-листы",
-                            options=list(checklist_options.keys()),
-                            default=[cl.name for cl in pos.checklists],
-                            key=f"checklists_{pos.id}"
-                        )
-                        selected_ids = [checklist_options[name] for name in selected_names]
-
                         col_save, col_cancel = st.columns(2)
                         with col_save:
                             if st.button("💾 Сохранить", key=f"save_pos_{pos.id}"):
-                                # Сохраняем имя
                                 pos.name = new_name
-                                # Привязка чек-листов
-                                pos.checklists = [cl for cl in checklists if cl.id in selected_ids]
                                 try:
                                     db.commit()
                                     st.success("Изменения сохранены")
@@ -141,3 +128,5 @@ def employees_tab(company_id):
                     db.commit()
                     st.success("Должность добавлена")
                     st.rerun()
+
+    db.close()
