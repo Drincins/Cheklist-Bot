@@ -1,0 +1,9 @@
+aiogram
+alembic
+python-dotenv
+sqlalchemy
+bcrypt
+pandas
+streamlit
+streamlit-cookies-manager
+streamlit
