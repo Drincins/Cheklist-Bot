@@ -80,8 +80,13 @@ def get_checklist_by_id(checklist_id: int) -> dict | None:
     with SessionLocal() as db:
         checklist = db.get(Checklist, checklist_id)
         if checklist:
-            return {"id": checklist.id, "name": checklist.name}
+            return {
+                "id": checklist.id,
+                "name": checklist.name,
+                "is_scored": checklist.is_scored  # <-- используем это
+            }
         return None
+
 
 def get_completed_checklists(user_id: int, page: int = 0, page_size: int = 8) -> list[dict]:
     with SessionLocal() as db:

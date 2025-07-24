@@ -7,3 +7,4 @@ class Form(StatesGroup):
     adding_comment = State()
     adding_photo = State()
     entering_name = State()
+    manual_text_answer = State()
