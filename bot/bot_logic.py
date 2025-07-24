@@ -41,8 +41,10 @@ def find_user_by_name_phone_company(name: str, phone: str, company_name: str | N
                 "company_id": user.company_id,
                 "company_name": company_name,
                 "position": user.position.name if user.position else "Не указано",
-            }
-        return None
+                # "department": user.department.name if user.department else "Не указано",
+        }
+    return None
+
 
 
 def get_checklists_for_user(user_id: int, page: int = 0, page_size: int = 8) -> list[dict]:

@@ -8,7 +8,7 @@ from bot_logic import (
     get_checklist_by_id,
 )
 from keyboards.inline import get_checklists_keyboard
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 import asyncio
 
 router = Router()
@@ -29,8 +29,13 @@ async def start_checklist(callback: types.CallbackQuery, state: FSMContext):
     questions = get_questions_for_checklist(checklist_id)
     if not questions:
         await callback.message.answer("У этого чек-листа нет вопросов.")
+        await callback.answer()
         return
     await state.update_data(checklist_id=checklist_id, questions=questions, current=0, answers=[])
+
+    # 🔽 Скрываем клавиатуру
+    await callback.message.answer("📝 Начинаем чек-лист...", reply_markup=ReplyKeyboardRemove())
+
     await ask_next_question(callback.message, state)
     await state.set_state(Form.answering_question)
     await callback.answer()
