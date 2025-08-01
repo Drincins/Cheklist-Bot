@@ -1,7 +1,7 @@
 import streamlit as st
 import os
-from checklist.db import SessionLocal
-from checklist.models import User, Checklist, ChecklistAnswer, ChecklistQuestion, ChecklistQuestionAnswer
+from checklist.db.db import SessionLocal
+from checklist.db.models import User, Checklist, ChecklistAnswer, ChecklistQuestion, ChecklistQuestionAnswer
 from sqlalchemy.exc import IntegrityError
 
 # --- Импорт aiogram только если нажата кнопка ---

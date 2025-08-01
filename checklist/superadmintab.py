@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
-from checklist.db import SessionLocal
-from checklist.models import Company, User
+from checklist.db.db import SessionLocal
+from checklist.db.models import Company, User
 from sqlalchemy.exc import IntegrityError
 import bcrypt
 

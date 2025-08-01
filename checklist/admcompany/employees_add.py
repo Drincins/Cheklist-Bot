@@ -1,9 +1,9 @@
 import streamlit as st
-from checklist.db import SessionLocal
-from checklist.models import User, Position
+from checklist.db.db import SessionLocal
+from checklist.db.models import User, Position, Department
 from sqlalchemy.exc import IntegrityError
 
-def add_employee_tab(company_id):
+def employees_add(company_id):
     db = SessionLocal()
     st.subheader("Добавление нового сотрудника")
 
@@ -13,8 +13,15 @@ def add_employee_tab(company_id):
         st.warning("Сначала добавьте хотя бы одну должность в разделе 'Должности'!")
         db.close()
         return
-
     position_options = {p.name: p.id for p in positions}
+
+    # Подгружаем подразделения для выбора
+    departments = db.query(Department).filter_by(company_id=company_id).all()
+    if not departments:
+        st.warning("Сначала добавьте хотя бы одно подразделение!")
+        db.close()
+        return
+    dep_options = {d.name: d.id for d in departments}
 
     with st.form("add_user_form"):
         last_name = st.text_input("Фамилия")
@@ -24,10 +31,16 @@ def add_employee_tab(company_id):
             st.markdown("### +7")
         with col2:
             raw_phone = st.text_input("Телефон (10 цифр)", max_chars=10)
-        # Выбор из списка должностей
+
+        # Выбор должности
         pos_names = list(position_options.keys())
         selected_pos_name = st.selectbox("Должность", pos_names)
         position_id = position_options[selected_pos_name]
+
+        # Выбор подразделения (single-select, если нужен multi — замени на multiselect)
+        dep_names = list(dep_options.keys())
+        selected_dep_name = st.selectbox("Подразделение", dep_names)
+        department_id = dep_options[selected_dep_name]
 
         submitted = st.form_submit_button("Добавить")
         if submitted:
@@ -45,19 +58,17 @@ def add_employee_tab(company_id):
                     new_user = User(
                         name=full_name,
                         phone=phone,
-                        role="employee",
                         login=None,
                         hashed_password=None,
                         company_id=company_id,
                         position_id=position_id
                     )
                     db.add(new_user)
-                    try:
-                        db.commit()
-                        st.success(f"Сотрудник {full_name} успешно добавлен")
-                        st.rerun()
-                    except IntegrityError as e:
-                        db.rollback()
-                        st.error("Ошибка при добавлении сотрудника")
-                        st.exception(e)
+                    db.commit()
+                    # Привязываем к подразделению (many-to-many)
+                    department = db.query(Department).get(department_id)
+                    new_user.departments.append(department)
+                    db.commit()
+                    st.success(f"Сотрудник {full_name} успешно добавлен")
+                    st.rerun()
     db.close()
