@@ -1,0 +1,82 @@
+diff --git a/bot/bot_logic.py b/bot/bot_logic.py
+index 0000000..0000001 100644
+--- a/bot/bot_logic.py
++++ b/bot/bot_logic.py
+@@ -1,15 +1,22 @@
+ import sys
+ import os
+ import re
+ from sqlalchemy import func
+-from sqlalchemy.orm import joinedload
++from sqlalchemy.orm import joinedload
+ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+ 
+-from checklist.db import SessionLocal
+-from checklist.models import Company, User, Checklist, ChecklistQuestion, ChecklistAnswer
++from checklist.db.db import SessionLocal
++from checklist.db.models import (
++    Company,
++    Department,
++    User,
++    Checklist,
++    ChecklistQuestion,
++    ChecklistAnswer,
++    ChecklistQuestionAnswer,
++    Role,
++    Position,
++)
+ from datetime import datetime
+-from checklist.models import ChecklistQuestionAnswer
+ 
+ 
+ def normalize_phone(phone: str) -> str:
+@@
+-def find_user_by_name_phone_company(name: str, phone: str, company_name: str | None):
++def find_user_by_name_phone_company(name: str, phone: str, company_name: str | None):
+     clean_phone = normalize_phone(phone)
+ 
+     with SessionLocal() as db:
+-        query = db.query(User, Company.name.label("company_name")).join(Company, User.company_id == Company.id).options(
+-            joinedload(User.position)
+-        ).filter(
+-            User.name == name.strip(),
+-            func.right(User.phone, 10) == clean_phone,
+-            User.role == "employee"
+-        )
++        query = (
++            db.query(User, Company.name.label("company_name"))
++            .join(Company, User.company_id == Company.id)
++            .join(Position, User.position_id == Position.id, isouter=True)
++            .options(
++                joinedload(User.position).joinedload(Position.role),
++                joinedload(User.departments),
++            )
++            .filter(
++                User.name == name.strip(),
++                func.right(User.phone, 10) == clean_phone,
++                # роль теперь на Position -> Role
++                Position.role.has(name="employee") if User.position_id.isnot(None) else True
++            )
++        )
+ 
+         if company_name:
+             query = query.filter(Company.name == company_name.strip())
+ 
+         result = query.first()
+ 
+         if result:
+             user, company_name = result
+             return {
+                 "id": user.id,
+                 "name": user.name,
+                 "phone": user.phone,
+                 "company_id": user.company_id,
+-                # "company_name": company_name,
+-                # "position": user.position.name if user.position else "Не указано",
+-                # "department": user.department.name if user.department else "Не указано",
++                "company_name": company_name,
++                "position": user.position.name if user.position else "Не указано",
++                "departments": [d.name for d in (user.departments or [])],
+             }
+     return None
+
