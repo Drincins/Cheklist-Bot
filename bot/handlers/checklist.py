@@ -1,13 +1,13 @@
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
-from states import Form
-from bot_logic import (
+from ..states import Form
+from ..bot_logic import (
     get_checklists_for_user,
     get_questions_for_checklist,
     save_checklist_with_answers,
     get_checklist_by_id,
 )
-from keyboards.inline import get_checklists_keyboard
+from ..keyboards.inline import get_checklists_keyboard
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 import asyncio
 

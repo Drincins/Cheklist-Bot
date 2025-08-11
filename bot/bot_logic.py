@@ -6,9 +6,11 @@ from typing import Optional, List, Dict
 from sqlalchemy import func
 from sqlalchemy.orm import joinedload
 
-# чтобы импортировать пакет checklist из соседней директории
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# абсолютные импорты из соседнего пакета checklist
+from checklist.db.models.checklist import (
+    Checklist, ChecklistAnswer, ChecklistQuestion, ChecklistQuestionAnswer
+)
+from checklist.db.models.user import User
 
 # Берём SessionLocal из новой структуры
 from checklist.db.db import SessionLocal
@@ -17,16 +19,14 @@ from checklist.db.db import SessionLocal
 from checklist.db.models import (
     Company,
     Department,
-    User,
+    User as UserModel,   # чтобы не затереть импорт User выше (если не используешь — можешь убрать)
     Role,
     Position,
-    Checklist,
-    ChecklistQuestion,
-    ChecklistAnswer,
-    ChecklistQuestionAnswer,
+    Checklist as ChecklistModel,
+    ChecklistQuestion as ChecklistQuestionModel,
+    ChecklistAnswer as ChecklistAnswerModel,
+    ChecklistQuestionAnswer as ChecklistQuestionAnswerModel,
 )
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Утилиты
 # ──────────────────────────────────────────────────────────────────────────────
@@ -168,6 +168,110 @@ def save_checklist_with_answers(user_id: int, checklist_id: int, answers: List[D
 
         db.commit()
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Пройденные чек-листы (пагинация + данные для отчёта)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_completed_answers_paginated(user_id: int, offset: int = 0, limit: int = 8):
+    """
+    Возвращает:
+      items: список словарей [{"answer_id", "checklist_name", "submitted_at"}]
+      total: общее количество прохождений пользователя
+    """
+    with SessionLocal() as db:
+        base_q = (
+            db.query(ChecklistAnswer.id, Checklist.name, ChecklistAnswer.submitted_at)
+            .join(Checklist, Checklist.id == ChecklistAnswer.checklist_id)
+            .filter(ChecklistAnswer.user_id == user_id)
+            .order_by(ChecklistAnswer.submitted_at.desc())
+        )
+        total = base_q.count()
+        rows = base_q.offset(offset).limit(limit).all()
+        items = [
+            {"answer_id": r[0], "checklist_name": r[1], "submitted_at": r[2]}
+            for r in rows
+        ]
+        return items, total
+
+
+def get_answer_report_data(answer_id: int):
+    """
+    Возвращает словарь с полями для отчёта:
+      {
+        "checklist_name", "date", "time", "department", "result" (или None)
+      }
+    - department берём из департаментов пользователя
+    - result: если чек-лист помечен как is_scored, считаем:
+        • для yesno — % ответов «да»
+        • для scale — % среднего значения от максимума (meta.max, по умолчанию 10)
+      Если посчитать нечего — None
+    """
+    with SessionLocal() as db:
+        ans = db.get(ChecklistAnswer, answer_id)
+        if not ans:
+            return None
+
+        checklist = db.get(Checklist, ans.checklist_id)
+        user = db.get(User, ans.user_id)
+
+        # департаменты пользователя
+        departments = [d.name for d in (user.departments or [])] if user else []
+        department = ", ".join(departments) if departments else "—"
+
+        # базовые поля
+        date_str = ans.submitted_at.strftime("%d.%m.%Y")
+        time_str = ans.submitted_at.strftime("%H:%M")
+        checklist_name = checklist.name if checklist else "—"
+
+        # расчёт результата (если is_scored)
+        result = None
+        if checklist and getattr(checklist, "is_scored", False):
+            rows = (
+                db.query(
+                    ChecklistQuestion.type,
+                    ChecklistQuestion.meta,
+                    ChecklistQuestionAnswer.response_value,
+                )
+                .join(ChecklistQuestion, ChecklistQuestion.id == ChecklistQuestionAnswer.question_id)
+                .filter(ChecklistQuestionAnswer.answer_id == answer_id)
+                .all()
+            )
+
+            yes_cnt = 0
+            yes_total = 0
+            scale_sum = 0.0
+            scale_cnt = 0.0
+
+            for qtype, meta, resp in rows:
+                if qtype == "yesno":
+                    yes_total += 1
+                    if resp and str(resp).strip().lower() in ("да", "yes", "true", "1"):
+                        yes_cnt += 1
+                elif qtype == "scale":
+                    try:
+                        val = float(resp)
+                        mx = float((meta or {}).get("max", 10))
+                        if mx > 0:
+                            scale_sum += (val / mx)
+                            scale_cnt += 1.0
+                    except Exception:
+                        pass
+
+            parts = []
+            if yes_total > 0:
+                parts.append(f"{round(100 * yes_cnt / yes_total)}% «да»")
+            if scale_cnt > 0:
+                parts.append(f"{round(100 * (scale_sum / scale_cnt))}% шкала")
+            if parts:
+                result = " / ".join(parts)
+
+        return {
+            "checklist_name": checklist_name,
+            "date": date_str,
+            "time": time_str,
+            "department": department,
+            "result": result,
+        }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Служебные методы

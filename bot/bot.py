@@ -1,16 +1,16 @@
-# bot/bot.py
-# Aiogram v3.x
+import sys, os
+# добавляем КОРЕНЬ проекта, чтобы 'checklist' был виден как пакет
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import asyncio
 import logging
-import os
-
 from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
+from dotenv import load_dotenv
 
 # Роутеры
-from handlers import start, fsm, checklist, fallback
+from .handlers import start, fsm, checklist, fallback
 
 # Пытаемся взять токен из config.py, иначе — из .env / окружения
 BOT_TOKEN = None

@@ -4,9 +4,9 @@ from aiogram import Router, types
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 
-from keyboards.inline import get_start_keyboard, get_checklists_keyboard
-from keyboards.reply import authorized_keyboard
-from bot_logic import get_checklists_for_user
+from ..keyboards.inline import get_start_keyboard, get_checklists_keyboard
+from ..keyboards.reply import authorized_keyboard
+from ..bot_logic import get_checklists_for_user
 
 router = Router()  # ✅ ОБЯЗАТЕЛЬНО добавить
 
