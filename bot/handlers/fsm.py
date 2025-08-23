@@ -1,5 +1,7 @@
 # handlers/fsm.py
 
+
+from aiogram.exceptions import TelegramBadRequest
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from ..states import Form
@@ -13,8 +15,155 @@ from ..bot_logic import (
 from ..keyboards.inline import get_identity_confirmation_keyboard, get_checklists_keyboard
 from ..keyboards.reply import authorized_keyboard
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import json
+from urllib.parse import urlparse
+import aiohttp
+from aiogram.exceptions import TelegramBadRequest
+
+
+# экспорт отчётов
+from ..report_data import get_attempt_data
+from ..export import export_attempt_to_files
+from aiogram.types import FSInputFile
+import os
+import tempfile
+import uuid
+
 
 router = Router()
+
+# === Настройки медиа/фото для PDF ===
+MEDIA_ROOT = os.getenv("MEDIA_ROOT", "media")
+os.makedirs(MEDIA_ROOT, exist_ok=True)
+
+import json
+from urllib.parse import urlparse
+import aiohttp
+from aiogram.exceptions import TelegramBadRequest
+
+async def _save_bytes_to_temp(data_bytes: bytes, suffix: str = ".jpg") -> str:
+    tmp_name = f"{uuid.uuid4().hex}{suffix}"
+    local_path = os.path.join(tempfile.gettempdir(), tmp_name)
+    with open(local_path, "wb") as f:
+        f.write(data_bytes)
+    return local_path
+
+def _try_extract_file_id(s: str) -> str | None:
+    # file_id:XXXX → XXXX
+    if s.startswith("file_id:"):
+        return s.split("file_id:", 1)[1].strip() or None
+    # JSON-строка с file_id
+    if s and (s.lstrip().startswith("{") or s.lstrip().startswith("[")):
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict) and "file_id" in obj:
+                return obj["file_id"]
+            if isinstance(obj, list) and obj and isinstance(obj[0], dict) and "file_id" in obj[0]:
+                return obj[0]["file_id"]
+        except Exception:
+            return None
+    return None
+
+def _is_url(s: str) -> bool:
+    try:
+        u = urlparse(s)
+        return u.scheme in ("http", "https")
+    except Exception:
+        return False
+
+def _is_url(s: str) -> bool:
+    try:
+        u = urlparse(s)
+        return u.scheme in ("http", "https")
+    except Exception:
+        return False
+
+def _try_extract_file_id(s: str) -> str | None:
+    # file_id:XXXX → XXXX
+    if s.startswith("file_id:"):
+        return s.split("file_id:", 1)[1].strip() or None
+    # JSON-строка с file_id
+    t = s.lstrip()
+    if t.startswith("{") or t.startswith("["):
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict) and "file_id" in obj:
+                return obj["file_id"]
+            if isinstance(obj, list) and obj and isinstance(obj[0], dict) and "file_id" in obj[0]:
+                return obj[0]["file_id"]
+        except Exception:
+            return None
+    return None
+
+async def _save_bytes_to_temp(data_bytes: bytes, suffix: str = ".jpg") -> str:
+    tmp_name = f"{uuid.uuid4().hex}{suffix}"
+    local_path = os.path.join(tempfile.gettempdir(), tmp_name)
+    with open(local_path, "wb") as f:
+        f.write(data_bytes)
+    return local_path
+
+async def _hydrate_photos_for_attempt(data, bot):
+    ok = miss = 0
+    for row in data.answers:
+        p = row.photo_path
+        print(f"[PHOTO] raw value: {p!r}")  # лог сырого значения
+
+        if not p:
+            continue
+
+        # 1) Абсолютный локальный путь
+        if os.path.isabs(p) and os.path.exists(p):
+            ok += 1
+            continue
+
+        # 2) Относительный путь в MEDIA_ROOT
+        candidate = os.path.join(MEDIA_ROOT, p) if not os.path.isabs(p) else p
+        if os.path.exists(candidate):
+            row.photo_path = candidate
+            ok += 1
+            continue
+
+        # 3) URL
+        if _is_url(p):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(p) as resp:
+                        if resp.status == 200:
+                            content = await resp.read()
+                            suffix = os.path.splitext(urlparse(p).path)[1] or ".jpg"
+                            row.photo_path = await _save_bytes_to_temp(content, suffix=suffix)
+                            ok += 1
+                            continue
+                        else:
+                            print(f"[PHOTO] URL fetch failed {resp.status}: {p}")
+            except Exception as e:
+                print(f"[PHOTO] URL fetch error: {e}")
+
+        # 4) file_id (чистый, с префиксом, либо json)
+        file_id = _try_extract_file_id(p) or p
+        try:
+            tg_file = await bot.get_file(file_id)
+            tmp_name = f"{data.attempt_id}_{row.number}_{uuid.uuid4().hex}.jpg"
+            local_path = os.path.join(tempfile.gettempdir(), tmp_name)
+            # aiogram v3
+            await bot.download(tg_file, destination=local_path)
+            if os.path.exists(local_path):
+                row.photo_path = local_path
+                ok += 1
+            else:
+                row.photo_path = None
+                miss += 1
+        except TelegramBadRequest:
+            row.photo_path = None
+            miss += 1
+        except Exception as e:
+            print(f"[PHOTO] download error: {e}")
+            row.photo_path = None
+            miss += 1
+
+    print(f"[PHOTO] localized: {ok}, missing: {miss}")
+
+
 
 
 # 🚀 Нажал "Начать"
@@ -265,24 +414,67 @@ async def handle_completed_view(callback: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("completed_pdf:"))
 async def handle_completed_pdf(callback: types.CallbackQuery):
-    # Пока просто сообщение и возможность вернуться назад
+    # формат: completed_pdf:<answer_id>:<offset>
     parts = callback.data.split(":")
     answer_id = int(parts[1])
     offset = int(parts[2]) if len(parts) > 2 else 0
 
-    await callback.answer()  # закрыть "часики"
-    await callback.message.answer("📄 Отчёт сформирован! (демо)")
-    # остаёмся на текущем экране; возврат — кнопкой «⬅️ Назад к списку»
+    await callback.answer()  # закрыть «часики»
+
+    # 1) Собираем данные попытки из БД
+    data = get_attempt_data(answer_id)
+
+    # 🔹 ЗАГРУЖАЕМ/ПРИВОДИМ ФОТО К ЛОКАЛЬНЫМ ПУТЯМ
+    await _hydrate_photos_for_attempt(data, callback.bot)
+
+    # 2) Генерим файлы (PDF + XLSX), но отправим только PDF
+    pdf_path, xlsx_path = export_attempt_to_files(tmp_dir=None, data=data)
+
+    try:
+        # 3) Отправляем PDF
+        await callback.message.answer_document(
+            FSInputFile(pdf_path),
+            caption=f"📄 Отчёт PDF — {data.checklist_name}\n{data.user_name} · {data.submitted_at:%d.%m.%Y %H:%M}",
+        )
+    finally:
+        # 4) Чистим временные файлы
+        for p in (pdf_path, xlsx_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
 
 @router.callback_query(F.data.startswith("completed_excel:"))
 async def handle_completed_excel(callback: types.CallbackQuery):
+    # формат: completed_excel:<answer_id>:<offset>
     parts = callback.data.split(":")
     answer_id = int(parts[1])
     offset = int(parts[2]) if len(parts) > 2 else 0
 
     await callback.answer()
-    await callback.message.answer("📊 Отчёт сформирован! (демо)")
-    # остаёмся на текущем экране; возврат — кнопкой «⬅️ Назад к списку»
+
+    data = get_attempt_data(answer_id)
+
+    # 🔹 ЗАГРУЖАЕМ/ПРИВОДИМ ФОТО К ЛОКАЛЬНЫМ ПУТЯМ
+    await _hydrate_photos_for_attempt(data, callback.bot)
+
+    pdf_path, xlsx_path = export_attempt_to_files(tmp_dir=None, data=data)
+
+    try:
+        await callback.message.answer_document(
+            FSInputFile(xlsx_path),
+            caption=f"📊 Отчёт Excel — {data.checklist_name}\n{data.user_name} · {data.submitted_at:%d.%m.%Y %H:%M}",
+        )
+    finally:
+        for p in (pdf_path, xlsx_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -319,7 +511,8 @@ async def return_to_main_menu(callback: types.CallbackQuery):
 
 @router.message((F.text == "🚪 Выйти") | (F.text == "🚪 выйти"))
 async def handle_logout(message: types.Message, state: FSMContext):
-    from keyboards.inline import get_start_keyboard
+    # исправленный относительный импорт!
+    from ..keyboards.inline import get_start_keyboard
 
     await state.clear()
     await message.answer("🚪 Вы вышли из системы.")

@@ -296,3 +296,172 @@ def get_completed_checklists_for_user(user_id: int) -> List[Dict]:
             if name not in seen:
                 seen[name] = ts
         return [{"name": k, "completed_at": v} for k, v in seen.items()]
+
+# В КОНЕЦ bot/bot_logic.py добавь:
+
+from dataclasses import dataclass
+from typing import Optional, List
+import datetime as dt
+
+from checklist.db.db import SessionLocal
+from checklist.db.models.checklist import (
+    Checklist, ChecklistAnswer, ChecklistQuestion, ChecklistQuestionAnswer
+)
+from checklist.db.models.user import User
+from checklist.db.models.company import Company
+
+# Эти dataclass используются экспортом
+@dataclass
+class AnswerRow:
+    number: int
+    question: str
+    qtype: str
+    answer: str
+    comment: Optional[str] = None
+    score: Optional[float] = None      # набранный балл
+    weight: Optional[float] = None     # максимальный вес (из meta)
+    photo_path: Optional[str] = None
+
+@dataclass
+class AttemptData:
+    attempt_id: int
+    checklist_name: str
+    user_name: str
+    company_name: Optional[str]
+    submitted_at: dt.datetime
+    answers: List[AnswerRow]
+
+def get_attempt_data(attempt_id: int) -> AttemptData:
+    """
+    Собирает данные одной попытки (ChecklistAnswer + его ChecklistQuestionAnswer)
+    в нормализованный формат AttemptData для экспорта.
+    """
+    with SessionLocal() as db:
+        # 1) саму попытку
+        attempt: ChecklistAnswer = (
+            db.query(ChecklistAnswer)
+            .filter(ChecklistAnswer.id == attempt_id)
+            .one()
+        )
+
+        # 2) подтягиваем имя чек-листа, сотрудника, компании
+        checklist_name = db.query(Checklist.name).filter(Checklist.id == attempt.checklist_id).scalar() or f"Checklist #{attempt.checklist_id}"
+        user_row = db.query(User.name, User.company_id).filter(User.id == attempt.user_id).first()
+        user_name = user_row.name if user_row else "Неизвестный сотрудник"
+        company_name = None
+        if user_row and user_row.company_id:
+            company_name = db.query(Company.name).filter(Company.id == user_row.company_id).scalar()
+
+        submitted_at = attempt.submitted_at or dt.datetime.utcnow()
+
+        # 3) вытаскиваем ВСЕ вопросы этого чек-листа, чтобы сохранить порядок (order)
+        q_sub = (
+        db.query(
+            ChecklistQuestion.id,
+            ChecklistQuestion.text,
+            ChecklistQuestion.type,
+            ChecklistQuestion.order,
+            ChecklistQuestion.meta,            # ⬅️ ДОБАВИЛИ
+        )
+        .filter(ChecklistQuestion.checklist_id == attempt.checklist_id)
+        .subquery()
+    )
+
+
+        # 4) вытаскиваем ответы по этой попытке и джойним на вопросы
+        #    Ответ может отсутствовать на некоторый вопрос — тогда покажем пусто.
+        rows = []
+        q_and_a = (
+        db.query(
+            q_sub.c.id.label("qid"),
+            q_sub.c.text.label("qtext"),
+            q_sub.c.type.label("qtype"),
+            q_sub.c.order.label("qorder"),
+            q_sub.c.meta.label("qmeta"),                 # ⬅️ ДОБАВИЛИ
+            ChecklistQuestionAnswer.response_value,
+            ChecklistQuestionAnswer.comment,
+            ChecklistQuestionAnswer.photo_path,
+        )
+        .outerjoin(
+            ChecklistQuestionAnswer,
+            (ChecklistQuestionAnswer.question_id == q_sub.c.id) &
+            (ChecklistQuestionAnswer.answer_id == attempt_id)
+        )
+        .order_by(q_sub.c.order.asc())
+        .all()
+    )
+
+        for idx, row in enumerate(q_and_a, start=1):
+            answer_raw = row.response_value
+            answer_str = str(answer_raw) if answer_raw is not None else ""
+
+            # --- вытащим вес и параметры шкалы из meta ---
+            meta = row.qmeta or {}
+            weight = None
+            scale_max = None
+            if isinstance(meta, dict):
+                weight = meta.get("weight") or meta.get("score_weight") or meta.get("points")
+                scale_max = meta.get("max") or meta.get("scale_max")
+                # если нет max, но есть options (список значений шкалы)
+                if not scale_max and isinstance(meta.get("options"), (list, tuple)):
+                    scale_max = len(meta["options"])
+
+            # приведение типов
+            try:
+                if weight is not None:
+                    weight = float(weight)
+            except Exception:
+                weight = None
+
+            try:
+                if scale_max is not None:
+                    scale_max = float(scale_max)
+            except Exception:
+                scale_max = None
+
+            # --- вычислим набранный балл (score) по типу вопроса ---
+            qtype = (row.qtype or "").lower().strip()
+            score = None
+
+            if weight is not None:
+                if qtype in {"yesno", "boolean", "bool", "yn"}:
+                    s = answer_str.strip().lower()
+                    if s in {"yes", "да", "true", "1"}:
+                        score = weight
+                    else:
+                        # "no"/"нет"/"false"/"0"/пусто
+                        score = 0.0
+
+                elif qtype in {"scale", "rating"}:
+                    try:
+                        val = float(answer_str) if answer_str.strip() != "" else 0.0
+                    except Exception:
+                        val = 0.0
+                    mx = scale_max if (scale_max and scale_max > 0) else 10.0
+                    score = weight * (val / mx)
+
+                else:
+                    # для прочих типов обычно не считаем; оставим пусто
+                    score = None
+
+            rows.append(AnswerRow(
+                number=idx,
+                question=row.qtext,
+                qtype=row.qtype,
+                answer=answer_str,
+                comment=row.comment,
+                score=score,          # набранный балл
+                weight=weight,        # максимальный вес
+                photo_path=row.photo_path
+            ))
+
+
+
+        return AttemptData(
+            attempt_id=attempt_id,
+            checklist_name=checklist_name,
+            user_name=user_name,
+            company_name=company_name,
+            submitted_at=submitted_at,
+            answers=rows
+        )
