@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Table
+from sqlalchemy import Column, Integer, String, ForeignKey, Table, text
 from sqlalchemy.orm import relationship
 from checklist.db.base import Base 
 
@@ -13,6 +13,7 @@ class Role(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True, nullable=False)
     description = Column(String, nullable=True)
+    level = Column(Integer, nullable=False, server_default=text("1"))  
     # связь с должностями
     positions = relationship("Position", back_populates="role")
 

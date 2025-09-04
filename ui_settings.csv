@@ -1,0 +1,10 @@
+key,value
+theme_base,dark
+primaryColor,#FF7F00
+backgroundColor,#1E1E1E
+secondaryBackgroundColor,#2C2C2C
+textColor,#FFFFFF
+font_url,https://fonts.googleapis.com/css2?family=Comfortaa:wght@400;600&display=swap
+font_family,Comfortaa
+font_size_px,14
+wide_mode,true

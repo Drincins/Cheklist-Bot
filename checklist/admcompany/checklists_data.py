@@ -1,108 +1,170 @@
+# checklist/admcompany/checklists_data.py
 import streamlit as st
+import pandas as pd
+from sqlalchemy.orm import joinedload
+
 from checklist.db.db import SessionLocal
 from checklist.db.models import (
     Checklist,
     ChecklistQuestion,
     ChecklistAnswer,
     ChecklistQuestionAnswer,
+    Position,  # для назначения должностей
 )
 
-def checklists_data_tab(company_id):
+# ---------------------------
+#   ПОПОВЕР РЕДАКТИРОВАНИЯ
+# ---------------------------
+def _edit_checklist_popover(db, company_id: int, checklists: list[Checklist]):
+    """
+    Кнопка '✏️ Редактировать чек‑лист' с формой внутри st.popover:
+      - выбор чек-листа,
+      - изменение названия,
+      - отметка 'оцениваемый',
+      - привязка к должностям,
+      - двухкликовое удаление (через session_state).
+    """
+    label = "✏️ Редактировать чек‑лист"
+    if hasattr(st, "popover"):
+        ctx = st.popover(label, use_container_width=True)
+    else:
+        # Фоллбэк на старые версии Streamlit
+        ctx = st.expander(label, expanded=True)
+
+    with ctx:
+        if not checklists:
+            st.info("Нет чек‑листов для редактирования.")
+            return
+
+        # Выбор чек-листа по имени
+        by_name = {cl.name: cl for cl in checklists}
+        selected_name = st.selectbox("Выберите чек‑лист", list(by_name.keys()), key="ck_pop_sel")
+        cl = by_name[selected_name]
+
+        # Пул должностей компании
+        all_positions = (
+            db.query(Position)
+            .filter_by(company_id=company_id)
+            .order_by(Position.name.asc())
+            .all()
+        )
+        pos_map = {p.name: p.id for p in all_positions}
+        current_ids = {p.id for p in (cl.positions or [])}
+        default_names = [p.name for p in all_positions if p.id in current_ids]
+
+        # Форма редактирования
+        with st.form("ck_pop_form"):
+            new_name = st.text_input("Название чек‑листа", value=cl.name, key="ck_pop_name")
+            new_is_scored = st.checkbox("Оцениваемый чек‑лист?", value=cl.is_scored, key="ck_pop_scored")
+            chosen_pos_names = st.multiselect(
+                "Должности, которым назначен чек‑лист",
+                options=list(pos_map.keys()),
+                default=default_names,
+                key="ck_pop_positions"
+            )
+            chosen_ids = [pos_map[n] for n in chosen_pos_names]
+
+            col_save, col_del = st.columns(2)
+            save_btn = col_save.form_submit_button("💾 Сохранить")
+            del_btn  = col_del.form_submit_button("🗑️ Удалить", type="secondary")
+
+        # Сохранение
+        if save_btn:
+            try:
+                cl.name = (new_name or "").strip() or cl.name
+                cl.is_scored = new_is_scored
+                cl.positions = [p for p in all_positions if p.id in chosen_ids]
+                db.commit()
+                st.success("Изменения сохранены.")
+                st.rerun()
+            except Exception as e:
+                db.rollback()
+                st.error(f"Ошибка при сохранении: {e}")
+
+        # Двухкликовое подтверждение удаления (через session_state)
+        if del_btn:
+            st.session_state["__del_ck_pending"] = cl.id
+
+        if st.session_state.get("__del_ck_pending") == cl.id:
+            st.warning("Удаление чек‑листа необратимо. Будут удалены все вопросы и ответы.")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅ Да, удалить навсегда", key=f"ck_confirm_del_{cl.id}"):
+                    try:
+                        # 1) собрать id вопросов
+                        q_ids = [qid for (qid,) in db.query(ChecklistQuestion.id)
+                                 .filter_by(checklist_id=cl.id).all()]
+                        # 2) удалить ответы на вопросы
+                        if q_ids:
+                            db.query(ChecklistQuestionAnswer).filter(
+                                ChecklistQuestionAnswer.question_id.in_(q_ids)
+                            ).delete(synchronize_session=False)
+                        # 3) удалить ответы чек‑листа
+                        db.query(ChecklistAnswer).filter_by(
+                            checklist_id=cl.id
+                        ).delete(synchronize_session=False)
+                        # 4) удалить вопросы
+                        db.query(ChecklistQuestion).filter_by(
+                            checklist_id=cl.id
+                        ).delete(synchronize_session=False)
+                        # 5) удалить сам чек‑лист
+                        db.delete(cl)
+                        db.commit()
+                        st.success("Чек‑лист удалён.")
+                    except Exception as e:
+                        db.rollback()
+                        st.error(f"Ошибка при удалении: {e}")
+                    finally:
+                        st.session_state.pop("__del_ck_pending", None)
+                        st.rerun()
+            with c2:
+                if st.button("Отмена", key=f"ck_cancel_del_{cl.id}"):
+                    st.session_state.pop("__del_ck_pending", None)
+                    st.rerun()
+
+
+# ---------------------------
+#        TAB RENDER
+# ---------------------------
+def checklists_data_tab(company_id: int):
     db = SessionLocal()
     try:
-        st.markdown("### Все чек-листы компании")
+        st.subheader("Все чек-листы компании")
 
-        # Стабильный порядок списка
+        # Список чек‑листов с подгруженными должностями
         checklists = (
             db.query(Checklist)
-            .filter_by(company_id=company_id)
+            .options(joinedload(Checklist.positions))
+            .filter(Checklist.company_id == company_id)
             .order_by(Checklist.name.asc())
             .all()
         )
 
         if not checklists:
-            st.info("Чек-листов пока нет.")
+            st.info("Чек‑листов пока нет.")
             return
 
+        # «Красивая» таблица без ID
+        rows = []
         for cl in checklists:
-            col1, col2 = st.columns([8, 2])
-            with col1:
-                st.write(f"• {cl.name}")
-            with col2:
-                if st.button("Удалить", key=f"del_cl_{cl.id}"):
-                    # Запоминаем ID для подтверждения удаления
-                    st.session_state["confirm_del_checklist_id"] = cl.id
+            pos_names = ", ".join(sorted([p.name for p in (cl.positions or [])])) or "—"
+            rows.append({
+                "Чек‑лист": cl.name,
+                "Оцениваемый": "Да" if cl.is_scored else "Нет",
+                "Должности (назначено)": pos_names,
+            })
+        st.markdown("### 📋 Существующие чек‑листы")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        # Блок подтверждения удаления
-        confirm_id = st.session_state.get("confirm_del_checklist_id")
-        if confirm_id:
-            cl = (
-                db.query(Checklist)
-                .filter_by(id=confirm_id, company_id=company_id)
-                .first()
-            )
-            if cl:
-                st.warning(f"Удалить чек-лист «{cl.name}» и все связанные данные (вопросы и ответы)?")
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("Да, удалить навсегда", key="confirm_del_yes"):
-                        try:
-                            # 1) Собираем id всех вопросов чек-листа
-                            q_ids = [
-                                qid for (qid,) in db.query(ChecklistQuestion.id)
-                                .filter_by(checklist_id=cl.id)
-                                .all()
-                            ]
+        st.markdown("---")
 
-                            # 2) Удаляем ответы на вопросы (FK: checklist_question_answers.question_id → checklist_questions.id)
-                            deleted_q_answers = 0
-                            if q_ids:
-                                deleted_q_answers = (
-                                    db.query(ChecklistQuestionAnswer)
-                                    .filter(ChecklistQuestionAnswer.question_id.in_(q_ids))
-                                    .delete(synchronize_session=False)
-                                )
+        # Кнопка-­поповер «Редактировать» в стиле employees_position
+        c1, _ = st.columns([1, 3])
+        with c1:
+            _edit_checklist_popover(db, company_id, checklists)
 
-                            # 3) Удаляем сами "ответы чек-листа" (FK: checklist_answers.checklist_id → checklists.id)
-                            deleted_answers = (
-                                db.query(ChecklistAnswer)
-                                .filter_by(checklist_id=cl.id)
-                                .delete(synchronize_session=False)
-                            )
+        # ВНИМАНИЕ: отдельного блока подтверждения удаления НЕ нужно —
+        # он уже реализован внутри popover через session_state["__del_ck_pending"].
 
-                            # 4) Удаляем вопросы чек-листа
-                            deleted_questions = (
-                                db.query(ChecklistQuestion)
-                                .filter_by(checklist_id=cl.id)
-                                .delete(synchronize_session=False)
-                            )
-
-                            # 5) Удаляем сам чек-лист
-                            db.delete(cl)
-
-                            # Фиксируем изменения
-                            db.commit()
-
-                            st.success(
-                                f"Удалено: чек-лист «{cl.name}». "
-                                f"Вопросов: {deleted_questions}, "
-                                f"ответов на вопросы: {deleted_q_answers}, "
-                                f"ответов по чек-листу: {deleted_answers}."
-                            )
-                        except Exception as e:
-                            db.rollback()
-                            st.error(f"Ошибка при удалении: {e}")
-                        finally:
-                            # Сбрасываем состояние и обновляем список
-                            st.session_state.pop("confirm_del_checklist_id", None)
-                            st.rerun()
-
-                with c2:
-                    if st.button("Отмена", key="confirm_del_no"):
-                        st.session_state.pop("confirm_del_checklist_id", None)
-                        st.info("Удаление отменено.")
-            else:
-                # Если чек-лист уже не найден — чистим состояние
-                st.session_state.pop("confirm_del_checklist_id", None)
     finally:
         db.close()

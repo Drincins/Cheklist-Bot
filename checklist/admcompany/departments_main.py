@@ -84,7 +84,7 @@ def departments_main(company_id: int):
 
     if not deps:
         st.info("Пока нет ни одного подразделения.")
-        df = pd.DataFrame(columns=["ID", "Подразделение", "Сотрудники", "Чек‑листы"])
+        df = pd.DataFrame(columns=["Подразделение", "Сотрудники", "Чек‑листы"])
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
         rows = []
@@ -92,7 +92,6 @@ def departments_main(company_id: int):
             dep_positions = _dep_positions(db, d.id)
             cls_cnt = len(_union_checklists(dep_positions))
             rows.append({
-                "ID": d.id,
                 "Подразделение": d.name,
                 "Сотрудники": len(d.users or []),
                 "Чек‑листы": cls_cnt,
@@ -110,7 +109,12 @@ def departments_main(company_id: int):
 def _show_add_edit_modal(db, company_id: int):
     @(_modal("Подразделение: добавить / редактировать"))
     def _content():
-        mode = st.radio("Режим", ["Создать новое", "Редактировать существующее"], horizontal=True, key="dep_mode")
+        mode = st.radio(
+            "Режим",
+            ["Создать новое", "Редактировать существующее"],
+            horizontal=True,
+            key="dep_mode"
+        )
 
         dep_to_edit: Optional[Department] = None
         if mode == "Редактировать существующее":
@@ -120,7 +124,7 @@ def _show_add_edit_modal(db, company_id: int):
                 .order_by(Department.name.asc())
                 .all()
             )
-            options = {f"[{d.id}] {d.name}": d.id for d in deps_all}
+            options = {d.name: d.id for d in deps_all}  # показываем только имена
             if not options:
                 st.info("Нет подразделений для редактирования.")
                 st.button("Закрыть", key="close_no_deps", on_click=st.rerun)
@@ -131,7 +135,7 @@ def _show_add_edit_modal(db, company_id: int):
         default_name = dep_to_edit.name if dep_to_edit else ""
         new_name = st.text_input("Название подразделения", value=default_name, key="dep_name_input")
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("💾 Сохранить", type="primary", key="dep_save_btn"):
                 try:
@@ -141,11 +145,50 @@ def _show_add_edit_modal(db, company_id: int):
                         dep_id=(dep_to_edit.id if dep_to_edit else None),
                         name=new_name,
                     )
-                    st.success(f"Сохранено: [{saved.id}] {saved.name}")
+                    st.success(f"Сохранено: {saved.name}")  # без ID
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
         with c2:
             st.button("Отмена", key="dep_cancel_btn", on_click=st.rerun)
+
+        # --- кнопка удаления доступна только в режиме редактирования
+        with c3:
+            if dep_to_edit and st.button("🗑️ Удалить подразделение", key="dep_delete_btn"):
+                # запоминаем в сессии ID для подтверждения (двухкликовая защита)
+                st.session_state["__del_dep_pending"] = dep_to_edit.id
+
+        # --- блок подтверждения удаления (вне «кнопки», чтобы пережить rerun)
+        pending_id = st.session_state.get("__del_dep_pending")
+        if dep_to_edit and pending_id == dep_to_edit.id:
+            # считаем привязанных пользователей (будут просто отвязаны)
+            users_count = len(dep_to_edit.users or [])
+            st.warning(
+                f"Удалить подразделение «{dep_to_edit.name}»? "
+                f"Сотрудники ({users_count}) будут отвязаны от этого подразделения."
+            )
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("✅ Да, удалить навсегда", key="dep_del_confirm"):
+                    try:
+                        # Повторно берём объект из БД (на случай, если он был обновлён)
+                        dep = db.query(Department).get(dep_to_edit.id)
+                        if dep:
+                            # Явно очищаем many-to-many на всякий случай
+                            dep.users.clear()
+                            db.commit()
+                            db.delete(dep)
+                            db.commit()
+                        st.success("Подразделение удалено.")
+                    except Exception as e:
+                        db.rollback()
+                        st.error(f"Ошибка при удалении: {e}")
+                    finally:
+                        st.session_state.pop("__del_dep_pending", None)
+                        st.rerun()
+            with cc2:
+                if st.button("Отмена", key="dep_del_cancel"):
+                    st.session_state.pop("__del_dep_pending", None)
+                    st.info("Удаление отменено.")
 
     _content()
