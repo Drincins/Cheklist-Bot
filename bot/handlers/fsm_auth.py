@@ -1,4 +1,7 @@
 # handlers/fsm_auth.py — авторизация, профиль, выход
+import asyncio
+import html
+
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
@@ -13,59 +16,68 @@ from ..keyboards.inline import (
 from ..keyboards.reply import authorized_keyboard
 
 router = Router()
+auth_service = AuthService()
+
+
+def _escape(text: str | None) -> str:
+    return html.escape(text or "")
 
 
 @router.callback_query(F.data == "start_checklist")
-async def ask_name(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите вашу *Фамилию и Имя*:")
-    await state.set_state(Form.entering_name)
+async def ask_login(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите ваш логин:")
+    await state.set_state(Form.entering_login)
     await callback.answer()
 
 
-# ✍️ Вводит имя
-@router.message(Form.entering_name)
-async def ask_phone(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await message.answer("Введите ваш номер телефона:")
-    await state.set_state(Form.entering_phone)
+# ✍️ Вводит логин
+@router.message(Form.entering_login)
+async def ask_password(message: types.Message, state: FSMContext):
+    await state.update_data(login=message.text.strip())
+    await message.answer("Введите ваш пароль:")
+    await state.set_state(Form.entering_password)
 
 
-# ☎️ Вводит телефон → проверка
-@router.message(Form.entering_phone)
+# 🔐 Вводит пароль → проверка
+@router.message(Form.entering_password)
 async def confirm_user(message: types.Message, state: FSMContext):
-    await state.update_data(phone=message.text.strip())
+    await state.update_data(password=message.text.strip())
     data = await state.get_data()
 
-    name = data.get("name", "").strip()
-    phone = data.get("phone", "").strip()
+    login = data.get("login", "").strip()
+    password = data.get("password", "")
 
-    # company_id у тебя сейчас не вводится — передаём None (совместимо с текущей логикой)
-    svc = AuthService()
-    user = svc.find_user(name=name, phone=phone, company_id=None)
+    user = await asyncio.to_thread(auth_service.authenticate, login, password)
 
     if user:
         await state.update_data(user_id=user["id"], user=user)
-        await state.set_state(Form.show_checklists)
+        await state.set_state(Form.awaiting_confirmation)
 
-        await message.answer(
+        # не храним пароль в состоянии
+        await state.update_data(password=None)
+
+        details = (
             "🔎 Проверьте данные:\n\n"
-            f"*Фамилия и Имя:* {user['name']}\n"
-            f"*Телефон:* {user['phone']}\n"
-            f"*Компания:* {user.get('company_name', '—')}\n"
-            f"*Должность:* {user.get('position', '—')}",
+            f"<b>Сотрудник:</b> {_escape(user.get('name'))}\n"
+            f"<b>Логин:</b> {_escape(login)}\n"
+            f"<b>Компания:</b> {_escape(user.get('company_name', '—'))}\n"
+            f"<b>Должность:</b> {_escape(user.get('position', '—'))}"
+        )
+        await message.answer(
+            details,
             reply_markup=get_identity_confirmation_keyboard(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
     else:
         await message.answer(
-            "❌ Пользователь не найден.\n"
-            "Проверьте написание имени и последние 10 цифр телефона и попробуйте снова."
+            "❌ Неверный логин или пароль. Попробуйте снова."
         )
-        await state.set_state(Form.entering_name)
+        await state.update_data(password=None)
+        await state.set_state(Form.entering_login)
 
 
 # ✅ Подтверждение личности
-@router.callback_query(F.data == "confirm_identity", Form.show_checklists)
+@router.callback_query(F.data == "confirm_identity", Form.awaiting_confirmation)
 async def identity_approved(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user_id = data.get("user_id")
@@ -95,10 +107,10 @@ async def identity_approved(callback: types.CallbackQuery, state: FSMContext):
 
 
 # ❌ Отклонение
-@router.callback_query(F.data == "reject_identity", Form.show_checklists)
+@router.callback_query(F.data == "reject_identity", Form.awaiting_confirmation)
 async def identity_rejected(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Попробуем снова. Введите вашу *Фамилию и Имя*:")
-    await state.set_state(Form.entering_name)
+    await callback.message.answer("Попробуем снова. Введите ваш логин:")
+    await state.set_state(Form.entering_login)
     await callback.answer()
 
 
@@ -113,18 +125,18 @@ async def show_user_info(message: types.Message, state: FSMContext):
         return
 
     text = (
-        f"👤 *Информация о вас:*\n\n"
-        f"*Фамилия и Имя:* {user['name']}\n"
-        f"*Телефон:* {user['phone']}\n"
-        f"*Компания:* {user.get('company_name', '—')}\n"
-        f"*Должность:* {user.get('position', '—')}"
+        "👤 <b>Информация о вас:</b>\n\n"
+        f"<b>Фамилия и Имя:</b> {_escape(user.get('name'))}\n"
+        f"<b>Телефон:</b> {_escape(user.get('phone'))}\n"
+        f"<b>Компания:</b> {_escape(user.get('company_name', '—'))}\n"
+        f"<b>Должность:</b> {_escape(user.get('position', '—'))}"
     )
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="📋 Меню", callback_data="back_to_menu")]]
     )
 
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "back_to_menu")
@@ -142,8 +154,8 @@ async def handle_logout(message: types.Message, state: FSMContext):
     await message.answer("🚪 Вы вышли из системы.")
 
     await message.answer(
-        "👋 Добро пожаловать!\n\nНажмите *🚀 Начать*, чтобы пройти чек-лист.\n"
-        "Или *📖 Инструкция*, чтобы узнать подробнее.",
+        "👋 Добро пожаловать!\n\nНажмите <b>🚀 Начать</b>, чтобы пройти чек-лист.\n"
+        "Или <b>📖 Инструкция</b>, чтобы узнать подробнее.",
         reply_markup=get_start_keyboard(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )

@@ -1,9 +1,8 @@
 # bot/repositories/attempts.py
 from __future__ import annotations
-from typing import Optional
+from typing import Dict, Optional
 from datetime import datetime
 
-from sqlalchemy import and_
 from checklist.db.db import SessionLocal
 from checklist.db.models.checklist import ChecklistAnswer, ChecklistQuestionAnswer
 
@@ -26,11 +25,33 @@ class AttemptsRepo:
             if draft:
                 return draft.id
 
-            new = ChecklistAnswer(user_id=user_id, checklist_id=checklist_id, submitted_at=None)
+            new = ChecklistAnswer(
+                user_id=user_id,
+                checklist_id=checklist_id,
+                started_at=datetime.utcnow(),
+                submitted_at=None,
+            )
             db.add(new)
             db.commit()
             db.refresh(new)
             return new.id
+
+    def get_answers_for_attempt(self, answer_id: int) -> Dict[int, Dict[str, Optional[str]]]:
+        with SessionLocal() as db:
+            rows = (
+                db.query(ChecklistQuestionAnswer)
+                .filter(ChecklistQuestionAnswer.answer_id == answer_id)
+                .all()
+            )
+
+            answers: Dict[int, Dict[str, Optional[str]]] = {}
+            for row in rows:
+                answers[row.question_id] = {
+                    "answer": row.response_value,
+                    "comment": row.comment,
+                    "photo_path": row.photo_path,
+                }
+            return answers
 
     def save_answer(self, answer_id: int, question_id: int, value: Optional[str]) -> None:
         with SessionLocal() as db:

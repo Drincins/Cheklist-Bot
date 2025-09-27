@@ -1,4 +1,5 @@
 # handlers/fsm_completed.py — пройденные чек-листы, отчёты
+import asyncio
 import os
 
 from aiogram import Router, types, F
@@ -12,8 +13,11 @@ from aiogram.types import (
 from ..services.completed import CompletedService         # сервис вместо прямых вызовов bot_logic
 from ..export import export_attempt_to_files
 from ..utils.media import hydrate_photos_for_attempt      # вынесенный хелпер
+from ..utils.timezone import format_moscow, to_moscow
+from ..utils.export_helpers import prepare_attempt_for_export
 
 router = Router()
+completed_service = CompletedService()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 📋 ПРОЙДЕННЫЕ ЧЕК-ЛИСТЫ
@@ -28,7 +32,7 @@ def _build_completed_list_text(items, offset: int) -> str:
     lines = ["Ваши последние чек-листы:\n"]
     for i, it in enumerate(items, start=1):
         idx = offset + i  # глобальная нумерация: 1..N
-        dt = it["submitted_at"].strftime("%d.%m.%Y %H:%M")
+        dt = format_moscow(it["submitted_at"], "%d.%m.%Y %H:%M")
         lines.append(f"{idx}. {it['checklist_name']} — {dt}")
     return "\n".join(lines)
 
@@ -85,8 +89,12 @@ async def handle_completed_list(message: types.Message, state: FSMContext):
         return
 
     offset = 0
-    svc = CompletedService()
-    items, total = svc.get_paginated(user_id=user_id, offset=offset, limit=PAGE_LIMIT)
+    items, total = await asyncio.to_thread(
+        completed_service.get_paginated,
+        user_id,
+        offset,
+        PAGE_LIMIT,
+    )
 
     if total == 0:
         await message.answer("🕵️‍♂️ Вы ещё не проходили ни одного чек-листа.")
@@ -111,8 +119,12 @@ async def handle_completed_page(callback: types.CallbackQuery, state: FSMContext
     except Exception:
         offset = 0
 
-    svc = CompletedService()
-    items, total = svc.get_paginated(user_id=user_id, offset=offset, limit=PAGE_LIMIT)
+    items, total = await asyncio.to_thread(
+        completed_service.get_paginated,
+        user_id,
+        offset,
+        PAGE_LIMIT,
+    )
 
     text = _build_completed_list_text(items, offset)
     kb = _build_completed_list_kb(items, offset, total)
@@ -122,14 +134,21 @@ async def handle_completed_page(callback: types.CallbackQuery, state: FSMContext
 
 
 @router.callback_query(F.data.startswith("completed_view:"))
-async def handle_completed_view(callback: types.CallbackQuery):
+async def handle_completed_view(callback: types.CallbackQuery, state: FSMContext):
     # формат: completed_view:<answer_id>:<offset>
     parts = callback.data.split(":")
     answer_id = int(parts[1])
     offset = int(parts[2]) if len(parts) > 2 else 0
 
-    svc = CompletedService()
-    preview = svc.get_report_preview(answer_id)
+    preview = await asyncio.to_thread(completed_service.get_report_preview, answer_id)
+    try:
+        state_data = await state.get_data()
+    except Exception:
+        state_data = {}
+    recent_departments = state_data.get("recent_departments") or {}
+    override = recent_departments.get(str(answer_id))
+    if preview and override:
+        preview["department"] = override
     if not preview:
         await callback.answer("Не удалось получить данные отчёта", show_alert=True)
         return
@@ -157,7 +176,7 @@ async def handle_completed_view(callback: types.CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("completed_pdf:"))
-async def handle_completed_pdf(callback: types.CallbackQuery):
+async def handle_completed_pdf(callback: types.CallbackQuery, state: FSMContext):
     # формат: completed_pdf:<answer_id>:<offset>
     parts = callback.data.split(":")
     answer_id = int(parts[1])
@@ -166,14 +185,17 @@ async def handle_completed_pdf(callback: types.CallbackQuery):
     await callback.answer()  # закрыть «часики»
 
     # 1) Собираем данные попытки из БД
-    svc = CompletedService()
-    data = svc.get_attempt(answer_id)
+    data = await asyncio.to_thread(completed_service.get_attempt, answer_id)
+    state_data = await state.get_data()
+    override = (state_data.get("recent_departments") or {}).get(str(answer_id))
+    if data:
+        data = prepare_attempt_for_export(data, override)
 
     # 🔹 ЗАГРУЖАЕМ/ПРИВОДИМ ФОТО К ЛОКАЛЬНЫМ ПУТЯМ
     await hydrate_photos_for_attempt(data, callback.bot)
 
     # 2) Генерим файлы (PDF + XLSX), но отправим только PDF
-    pdf_path, xlsx_path = export_attempt_to_files(tmp_dir=None, data=data)
+    pdf_path, xlsx_path = await asyncio.to_thread(export_attempt_to_files, None, data)
 
     try:
         # 3) Отправляем PDF
@@ -192,7 +214,7 @@ async def handle_completed_pdf(callback: types.CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("completed_excel:"))
-async def handle_completed_excel(callback: types.CallbackQuery):
+async def handle_completed_excel(callback: types.CallbackQuery, state: FSMContext):
     # формат: completed_excel:<answer_id>:<offset>
     parts = callback.data.split(":")
     answer_id = int(parts[1])
@@ -200,13 +222,16 @@ async def handle_completed_excel(callback: types.CallbackQuery):
 
     await callback.answer()
 
-    svc = CompletedService()
-    data = svc.get_attempt(answer_id)
+    data = await asyncio.to_thread(completed_service.get_attempt, answer_id)
+    state_data = await state.get_data()
+    override = (state_data.get("recent_departments") or {}).get(str(answer_id))
+    if data:
+        data = prepare_attempt_for_export(data, override)
 
     # 🔹 ЗАГРУЖАЕМ/ПРИВОДИМ ФОТО К ЛОКАЛЬНЫМ ПУТЯМ
     await hydrate_photos_for_attempt(data, callback.bot)
 
-    pdf_path, xlsx_path = export_attempt_to_files(tmp_dir=None, data=data)
+    pdf_path, xlsx_path = await asyncio.to_thread(export_attempt_to_files, None, data)
 
     try:
         await callback.message.answer_document(

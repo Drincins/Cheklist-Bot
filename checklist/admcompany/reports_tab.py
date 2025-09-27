@@ -4,6 +4,7 @@ from datetime import datetime
 import pandas as pd
 from typing import Optional, Tuple, Dict
 from checklist.db.db import SessionLocal
+from bot.config import BOT_TOKEN
 from checklist.db.models import (
     User,
     Checklist,
@@ -357,10 +358,9 @@ def reports_tab(company_id=None):
 
     # -------- Кнопка принудительного обновления (бот + ресинк) --------
     # ⚠️ желательно перенести токен в .env и доставать из config
-    TOKEN = "7346157568:AAF_VYFkjq2tnyGrLykmb44ILNVdUbdGhbI"
     if st.button("🔁 Обновить изображения (скачать из Telegram + пересканировать папку)"):
         with st.spinner("Загрузка фото через бота..."):
-            count, errors = download_photos_via_bot(TOKEN)
+            count, errors = download_photos_via_bot(BOT_TOKEN)
         resynced = sync_local_photos_from_folder()
         st.success(f"Скачано: {count}, ошибок: {errors}. Локально обновлено: {resynced}.")
         st.rerun()

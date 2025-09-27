@@ -1,8 +1,10 @@
 # bot/repositories/questions.py
 from __future__ import annotations
+import json
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import asc
+from sqlalchemy.orm import selectinload
 from checklist.db.db import SessionLocal
 from checklist.db.models.checklist import Checklist, ChecklistQuestion, ChecklistQuestionAnswer, ChecklistAnswer
 
@@ -16,6 +18,7 @@ class QuestionsRepo:
             q = (
                 db.query(ChecklistQuestion)
                 .filter(ChecklistQuestion.checklist_id == checklist_id)
+                .options(selectinload(ChecklistQuestion.section))
             )
 
             # порядок: если есть поле order/position — используем, иначе по id
@@ -28,6 +31,31 @@ class QuestionsRepo:
 
             items = []
             for row in q.all():
+                section_name = None
+                section_id = getattr(row, "section_id", None)
+                section_obj = getattr(row, "section", None)
+                section_order = None
+                if section_obj is not None:
+                    section_name = getattr(section_obj, "name", None) or getattr(section_obj, "title", None)
+                    section_order = getattr(section_obj, "order", None) or getattr(section_obj, "position", None)
+                    if section_id is None:
+                        section_id = getattr(section_obj, "id", None)
+                if not section_name:
+                    section_name = getattr(row, "section_name", None) or getattr(row, "section_title", None) or getattr(row, "group_name", None)
+
+                meta = getattr(row, "meta", None)
+                if meta and not section_name:
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = {}
+                    if isinstance(meta, dict):
+                        section_candidate = meta.get("section") or meta.get("section_name") or meta.get("group")
+                        if isinstance(section_candidate, dict):
+                            section_name = section_candidate.get("name") or section_candidate.get("title")
+                        elif section_candidate:
+                            section_name = str(section_candidate)
                 items.append({
                     "id": row.id,
                     "text": getattr(row, "text", ""),
@@ -35,6 +63,11 @@ class QuestionsRepo:
                     "weight": getattr(row, "weight", 1),
                     "hint": getattr(row, "hint", None),
                     "options": getattr(row, "options", None),  # если в модели есть JSON-поле с вариантами
+                    "require_photo": bool(getattr(row, "require_photo", False)),
+                    "require_comment": bool(getattr(row, "require_comment", False)),
+                    "section_id": section_id,
+                    "section": section_name,
+                    "section_order": section_order,
                 })
             return items
 

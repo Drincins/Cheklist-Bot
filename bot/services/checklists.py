@@ -24,6 +24,9 @@ class ChecklistsService:
     def start_attempt(self, user_id: int, checklist_id: int) -> int:
         return self.attempts.get_or_create_draft(user_id=user_id, checklist_id=checklist_id)
 
+    def get_attempt_answers(self, answer_id: int) -> Dict[int, Dict[str, Optional[str]]]:
+        return self.attempts.get_answers_for_attempt(answer_id)
+
     def save_answer(self, answer_id: int, question_id: int, value: Optional[str]) -> None:
         self.attempts.save_answer(answer_id=answer_id, question_id=question_id, value=value)
 

@@ -1,8 +1,9 @@
 # bot/report_data.py
 import datetime as dt
 import json
-import re
+import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional, List, Any, Dict
 
@@ -12,6 +13,10 @@ from checklist.db.models.checklist import (
 )
 from checklist.db.models.user import User
 from checklist.db.models.company import Company
+
+from .utils.timezone import to_moscow
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -24,6 +29,7 @@ class AnswerRow:
     score: Optional[float] = None    # набранный балл
     weight: Optional[float] = None   # максимальный вес вопроса
     photo_path: Optional[str] = None
+    photo_label: Optional[str] = None
 
 
 @dataclass
@@ -32,8 +38,40 @@ class AttemptData:
     checklist_name: str
     user_name: str
     company_name: Optional[str]
+    department: Optional[str]
     submitted_at: dt.datetime
     answers: List[AnswerRow]
+    total_score: Optional[float] = None
+    total_max: Optional[float] = None
+    percent: Optional[float] = None
+    is_scored: bool = False
+
+
+# ---------------- formatting helpers ----------------
+
+def _fmt_number(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return ("{:.2f}".format(float(value))).rstrip("0").rstrip(".")
+    return str(value)
+
+
+def format_attempt_result(data: AttemptData, include_unscored: bool = False) -> Optional[str]:
+    if data.is_scored and data.total_score is not None and data.total_max is not None:
+        percent_text = f" ({_fmt_number(data.percent)}%)" if data.percent is not None else ""
+        return (
+            f"Набрано {_fmt_number(data.total_score)} из "
+            f"{_fmt_number(data.total_max)} баллов{percent_text}"
+        )
+
+    if include_unscored:
+        scored_rows = [r.score for r in data.answers if isinstance(r.score, (int, float))]
+        if scored_rows:
+            total_score = sum(float(s) for s in scored_rows)
+            return f"Набранные баллы: {_fmt_number(total_score)}"
+
+    return None
 
 
 # ---------------- helpers ----------------
@@ -44,7 +82,7 @@ def _dbg_enabled() -> bool:
 
 def _log(msg: str):
     if _dbg_enabled():
-        print(msg)
+        logger.debug(msg)
 
 
 def _as_dict(raw: Any) -> dict:
@@ -150,29 +188,27 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
             .one()
         )
 
-        checklist_name = (
-            db.query(Checklist.name)
-            .filter(Checklist.id == attempt.checklist_id)
-            .scalar()
-            or f"Checklist #{attempt.checklist_id}"
-        )
+        checklist_obj = db.get(Checklist, attempt.checklist_id)
+        checklist_name = checklist_obj.name if checklist_obj else f"Checklist #{attempt.checklist_id}"
+        is_scored = bool(getattr(checklist_obj, "is_scored", False))
 
-        user_row = (
-            db.query(User.name, User.company_id)
-            .filter(User.id == attempt.user_id)
-            .first()
-        )
+        user_row = db.get(User, attempt.user_id)
         user_name = user_row.name if user_row else "Неизвестный сотрудник"
 
         company_name = None
-        if user_row and user_row.company_id:
-            company_name = (
-                db.query(Company.name)
-                .filter(Company.id == user_row.company_id)
-                .scalar()
-            )
+        department_name = None
+        if user_row:
+            if user_row.company_id:
+                company_name = (
+                    db.query(Company.name)
+                    .filter(Company.id == user_row.company_id)
+                    .scalar()
+                )
+            if getattr(user_row, "departments", None):
+                department_name = ", ".join(d.name for d in user_row.departments if getattr(d, "name", None)) or None
 
         submitted_at = attempt.submitted_at or dt.datetime.utcnow()
+        submitted_at = to_moscow(submitted_at) or submitted_at
 
         # вопросы (meta берём сразу), чтобы сохранить порядок
         q_sub = (
@@ -219,6 +255,9 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
             return obj
 
         rows: List[AnswerRow] = []
+        total_score_acc = 0.0
+        total_max_acc = 0.0
+        has_scored_questions = False
         for idx, row in enumerate(q_and_a, start=1):
             answer_raw = row.response_value
             answer_str = "" if answer_raw is None else str(answer_raw)
@@ -243,12 +282,13 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
             meta_all = _merge_meta(m_q, m_cols)
 
             weight    = _extract_weight(meta_all)
-            scale_max = _extract_scale_max(meta_all)
+            scale_max = _extract_scale_max(meta_all) or 5.0
 
             qtype = (row.qtype or "").lower().strip()
             score: Optional[float] = None
 
             if weight is not None:
+                has_scored_questions = True
                 if qtype in {"yesno", "boolean", "bool", "yn"}:
                     s = answer_str.strip().lower()
                     score = weight if s in {"yes", "да", "true", "1"} else 0.0
@@ -257,8 +297,10 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
                         val = float(answer_str) if answer_str.strip() != "" else 0.0
                     except Exception:
                         val = 0.0
-                    mx = scale_max if (scale_max and scale_max > 0) else 10.0
-                    score = weight * (val / mx)
+                    mx = scale_max if (scale_max and scale_max > 0) else 5.0
+                    ratio = val / mx if mx else 0.0
+                    ratio = max(0.0, min(1.0, ratio))
+                    score = weight * ratio
                 else:
                     score = None
 
@@ -266,6 +308,12 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
                 _log(f"[SCORE] No weight for Q{idx} (id={row.qid}): '{row.qtext[:50]}', meta_all={meta_all}")
             else:
                 _log(f"[SCORE] Q{idx} (id={row.qid}): weight={weight}, type={qtype}, ans='{answer_str}', scale_max={scale_max} -> score={score}")
+                total_max_acc += weight
+                if score is not None:
+                    total_score_acc += max(0.0, score)
+                else:
+                    # вопрос с весом, но без подсчитанного балла — считаем 0
+                    total_score_acc += 0.0
 
             rows.append(AnswerRow(
                 number=idx,
@@ -275,14 +323,28 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
                 comment=row.comment,
                 score=score,
                 weight=weight,
-                photo_path=row.photo_path
+                photo_path=row.photo_path,
+                photo_label=f"Вопрос №{idx}",
             ))
+
+        total_score = None
+        total_max = None
+        percent = None
+        if is_scored and has_scored_questions and total_max_acc > 0:
+            total_score = round(total_score_acc, 2)
+            total_max = round(total_max_acc, 2)
+            percent = round((total_score_acc / total_max_acc) * 100, 2)
 
         return AttemptData(
             attempt_id=attempt_id,
             checklist_name=checklist_name,
             user_name=user_name,
             company_name=company_name,
+            department=department_name,
             submitted_at=submitted_at,
-            answers=rows
+            answers=rows,
+            total_score=total_score,
+            total_max=total_max,
+            percent=percent,
+            is_scored=is_scored,
         )

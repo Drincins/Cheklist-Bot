@@ -2,15 +2,18 @@
 from __future__ import annotations
 from typing import Any, Dict, Tuple, List
 
+import logging
+
 from sqlalchemy import func
 from checklist.db.db import SessionLocal
-from checklist.db.models.checklist import (
-    Checklist, ChecklistAnswer, ChecklistQuestion, ChecklistQuestionAnswer
-)
+from checklist.db.models.checklist import Checklist, ChecklistAnswer
 from checklist.db.models.user import User
 from checklist.db.models.company import Department
 
-from ..report_data import get_attempt_data  # подробные данные для экспорта
+from ..report_data import get_attempt_data, format_attempt_result  # подробные данные для экспорта
+from ..utils.timezone import to_moscow, format_moscow
+
+logger = logging.getLogger(__name__)
 
 class AnswersRepo:
     def get_completed_paginated(self, user_id: int, offset: int, limit: int) -> Tuple[List[Dict[str, Any]], int]:
@@ -38,7 +41,7 @@ class AnswersRepo:
                 {
                     "answer_id": r.answer_id,
                     "checklist_name": r.checklist_name,
-                    "submitted_at": r.submitted_at,
+                    "submitted_at": to_moscow(r.submitted_at),
                 }
                 for r in rows
             ]
@@ -61,34 +64,21 @@ class AnswersRepo:
             # подразделение — список отделов пользователя
             departments = ", ".join(d.name for d in (user.departments or [])) or "—"
 
-            # (опционально) быстрый результат: доля «Да» по yes/no
-            # если чек-лист оцениваемый — считаем процент «Да»
             result: str | None = None
             try:
-                if checklist.is_scored:
-                    q = (
-                        db.query(ChecklistQuestion.type, ChecklistQuestionAnswer.response_value)
-                        .join(ChecklistQuestion, ChecklistQuestion.id == ChecklistQuestionAnswer.question_id)
-                        .filter(ChecklistQuestionAnswer.answer_id == answer_id)
-                    )
-                    total_yesno = 0
-                    yes = 0
-                    for qt, resp in q.all():
-                        if qt == "yesno":
-                            total_yesno += 1
-                            if resp and str(resp).strip().lower() in ("да", "yes", "true", "1"):
-                                yes += 1
-                    if total_yesno > 0:
-                        result = f"{round(yes / total_yesno * 100)}%"
-            except Exception:
-                # если что-то пошло не так — просто не показываем result
-                result = None
+                attempt_data = get_attempt_data(answer_id)
+            except Exception as exc:
+                logger.warning("[REPORT] get_attempt_data failed for answer_id=%s: %s", answer_id, exc)
+                attempt_data = None
 
-            dt = ans.submitted_at
+            if attempt_data and getattr(attempt_data, "is_scored", False):
+                result = format_attempt_result(attempt_data)
+
+            dt = to_moscow(ans.submitted_at)
             return {
                 "checklist_name": checklist.name,
-                "date": dt.strftime("%d.%m.%Y"),
-                "time": dt.strftime("%H:%M"),
+                "date": format_moscow(dt, "%d.%m.%Y"),
+                "time": format_moscow(dt, "%H:%M"),
                 "department": departments,
                 "result": result,
             }

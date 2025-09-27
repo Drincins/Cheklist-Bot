@@ -29,3 +29,6 @@ class AuthService:
 
     def get_user_checklists(self, user_id: int):
         return self.checklists.get_for_user(user_id)
+
+    def authenticate(self, login: str, password: str) -> Optional[Dict[str, Any]]:
+        return self.users.find_by_credentials(login=login, password=password)

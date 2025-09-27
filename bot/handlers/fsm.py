@@ -1,45 +1,51 @@
-# handlers/fsm.py
+"""Основные FSM-хэндлеры бота."""
 
-
-from aiogram.exceptions import TelegramBadRequest
-from aiogram import Router, types, F
-from aiogram.fsm.context import FSMContext
-from ..states import Form
-from ..bot_logic import (
-    find_user_by_name_phone_company,
-    get_checklists_for_user,
-    get_completed_checklists_for_user,   # пусть останется, вдруг используется ещё где-то
-    get_completed_answers_paginated,     # НОВОЕ — используется ниже
-    get_answer_report_data,              # НОВОЕ — используется ниже
-)
-from ..keyboards.inline import get_identity_confirmation_keyboard, get_checklists_keyboard
-from ..keyboards.reply import authorized_keyboard
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import asyncio
 import json
-from urllib.parse import urlparse
-import aiohttp
-from aiogram.exceptions import TelegramBadRequest
-
-
-# экспорт отчётов
-from ..report_data import get_attempt_data
-from ..export import export_attempt_to_files
-from aiogram.types import FSInputFile
+import logging
 import os
 import tempfile
 import uuid
+from urllib.parse import urlparse
 
+import aiohttp
+from aiogram import Router, types, F
+from aiogram.exceptions import TelegramBadRequest, SkipHandler
+from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+
+from ..bot_logic import (
+    get_checklists_for_user,
+    get_completed_checklists_for_user,
+    get_completed_answers_paginated,
+    get_answer_report_data,
+)
+from ..export import export_attempt_to_files
+from ..keyboards.inline import get_identity_confirmation_keyboard, get_checklists_keyboard
+from ..keyboards.reply import authorized_keyboard
+from ..report_data import get_attempt_data
+from ..services.auth import AuthService
+from ..states import Form
+from ..utils.export_helpers import prepare_attempt_for_export
+from ..utils.timezone import format_moscow, to_moscow
+
+
+logger = logging.getLogger(__name__)
 
 router = Router()
+auth_service = AuthService()
 
 # === Настройки медиа/фото для PDF ===
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "media")
 os.makedirs(MEDIA_ROOT, exist_ok=True)
 
-import json
-from urllib.parse import urlparse
-import aiohttp
-from aiogram.exceptions import TelegramBadRequest
+_RESERVED_TEXT_COMMANDS = {
+    "🏠 Домой",
+    "🚪 Выйти",
+    "✅ Доступные чек-листы",
+    "📋 Пройденные чек-листы",
+    "ℹ️ Обо мне",
+}
 
 async def _save_bytes_to_temp(data_bytes: bytes, suffix: str = ".jpg") -> str:
     tmp_name = f"{uuid.uuid4().hex}{suffix}"
@@ -106,7 +112,7 @@ async def _hydrate_photos_for_attempt(data, bot):
     ok = miss = 0
     for row in data.answers:
         p = row.photo_path
-        print(f"[PHOTO] raw value: {p!r}")  # лог сырого значения
+        logger.debug("[PHOTO] raw value: %r", p)
 
         if not p:
             continue
@@ -135,9 +141,9 @@ async def _hydrate_photos_for_attempt(data, bot):
                             ok += 1
                             continue
                         else:
-                            print(f"[PHOTO] URL fetch failed {resp.status}: {p}")
+                            logger.warning("[PHOTO] URL fetch failed %s: %s", resp.status, p)
             except Exception as e:
-                print(f"[PHOTO] URL fetch error: {e}")
+                logger.warning("[PHOTO] URL fetch error: %s", e)
 
         # 4) file_id (чистый, с префиксом, либо json)
         file_id = _try_extract_file_id(p) or p
@@ -157,51 +163,50 @@ async def _hydrate_photos_for_attempt(data, bot):
             row.photo_path = None
             miss += 1
         except Exception as e:
-            print(f"[PHOTO] download error: {e}")
+            logger.warning("[PHOTO] download error: %s", e)
             row.photo_path = None
             miss += 1
 
-    print(f"[PHOTO] localized: {ok}, missing: {miss}")
+    logger.info("[PHOTO] localized: %s, missing: %s", ok, miss)
 
 
 
 
 # 🚀 Нажал "Начать"
 @router.callback_query(F.data == "start_checklist")
-async def ask_name(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите вашу *Фамилию и Имя*:")
-    await state.set_state(Form.entering_name)
+async def ask_login(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите ваш логин:")
+    await state.set_state(Form.entering_login)
     await callback.answer()
 
 
-# ✍️ Вводит имя
-@router.message(Form.entering_name)
-async def ask_phone(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await message.answer("Введите ваш номер телефона:")
-    await state.set_state(Form.entering_phone)
+# ✍️ Вводит логин
+@router.message(Form.entering_login)
+async def ask_password(message: types.Message, state: FSMContext):
+    await state.update_data(login=message.text.strip())
+    await message.answer("Введите ваш пароль:")
+    await state.set_state(Form.entering_password)
 
 
-# ☎️ Вводит телефон → проверка
-@router.message(Form.entering_phone)
+# 🔐 Вводит пароль → проверка
+@router.message(Form.entering_password)
 async def confirm_user(message: types.Message, state: FSMContext):
-    await state.update_data(phone=message.text.strip())
+    await state.update_data(password=message.text.strip())
     data = await state.get_data()
 
-    user = find_user_by_name_phone_company(
-        data.get("name", "").strip(),
-        data.get("phone", "").strip(),
-        company_name=None,
-    )
+    login = data.get("login", "").strip()
+    password = data.get("password", "")
+
+    user = await asyncio.to_thread(auth_service.authenticate, login, password)
 
     if user:
-        await state.update_data(user_id=user["id"], user=user)
-        await state.set_state(Form.show_checklists)
+        await state.update_data(user_id=user["id"], user=user, password=None)
+        await state.set_state(Form.awaiting_confirmation)
 
         await message.answer(
             "🔎 Проверьте данные:\n\n"
-            f"*Фамилия и Имя:* {user['name']}\n"
-            f"*Телефон:* {user['phone']}\n"
+            f"*Сотрудник:* {user['name']}\n"
+            f"*Логин:* {login}\n"
             f"*Компания:* {user.get('company_name', '—')}\n"
             f"*Должность:* {user.get('position', '—')}",
             reply_markup=get_identity_confirmation_keyboard(),
@@ -209,14 +214,14 @@ async def confirm_user(message: types.Message, state: FSMContext):
         )
     else:
         await message.answer(
-            "❌ Пользователь не найден.\n"
-            "Проверьте написание имени и последние 10 цифр телефона и попробуйте снова."
+            "❌ Неверный логин или пароль. Попробуйте снова."
         )
-        await state.set_state(Form.entering_name)
+        await state.update_data(password=None)
+        await state.set_state(Form.entering_login)
 
 
 # ✅ Подтверждение личности
-@router.callback_query(F.data == "confirm_identity", Form.show_checklists)
+@router.callback_query(F.data == "confirm_identity", Form.awaiting_confirmation)
 async def identity_approved(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user_id = data.get("user_id")
@@ -245,10 +250,10 @@ async def identity_approved(callback: types.CallbackQuery, state: FSMContext):
 
 
 # ❌ Отклонение
-@router.callback_query(F.data == "reject_identity", Form.show_checklists)
+@router.callback_query(F.data == "reject_identity", Form.awaiting_confirmation)
 async def identity_rejected(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Попробуем снова. Введите вашу *Фамилию и Имя*:")
-    await state.set_state(Form.entering_name)
+    await callback.message.answer("Попробуем снова. Введите ваш логин:")
+    await state.set_state(Form.entering_login)
     await callback.answer()
 
 
@@ -285,7 +290,7 @@ def _build_completed_list_text(items, offset: int) -> str:
     lines = ["Ваши последние чек-листы:\n"]
     for i, it in enumerate(items, start=1):
         idx = offset + i  # глобальная нумерация: 1..N
-        dt = it["submitted_at"].strftime("%d.%m.%Y %H:%M")
+        dt = format_moscow(it["submitted_at"], "%d.%m.%Y %H:%M")
         lines.append(f"{idx}. {it['checklist_name']} — {dt}")
     return "\n".join(lines)
 
@@ -413,7 +418,7 @@ async def handle_completed_view(callback: types.CallbackQuery):
     await callback.answer()
 
 @router.callback_query(F.data.startswith("completed_pdf:"))
-async def handle_completed_pdf(callback: types.CallbackQuery):
+async def handle_completed_pdf(callback: types.CallbackQuery, state: FSMContext):
     # формат: completed_pdf:<answer_id>:<offset>
     parts = callback.data.split(":")
     answer_id = int(parts[1])
@@ -423,6 +428,11 @@ async def handle_completed_pdf(callback: types.CallbackQuery):
 
     # 1) Собираем данные попытки из БД
     data = get_attempt_data(answer_id)
+    state_data = await state.get_data()
+    recent_departments = state_data.get("recent_departments") or {}
+    override = recent_departments.get(str(answer_id)) if data else None
+    if data:
+        data = prepare_attempt_for_export(data, override)
 
     # 🔹 ЗАГРУЖАЕМ/ПРИВОДИМ ФОТО К ЛОКАЛЬНЫМ ПУТЯМ
     await _hydrate_photos_for_attempt(data, callback.bot)
@@ -447,7 +457,7 @@ async def handle_completed_pdf(callback: types.CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("completed_excel:"))
-async def handle_completed_excel(callback: types.CallbackQuery):
+async def handle_completed_excel(callback: types.CallbackQuery, state: FSMContext):
     # формат: completed_excel:<answer_id>:<offset>
     parts = callback.data.split(":")
     answer_id = int(parts[1])
@@ -456,6 +466,11 @@ async def handle_completed_excel(callback: types.CallbackQuery):
     await callback.answer()
 
     data = get_attempt_data(answer_id)
+    state_data = await state.get_data()
+    recent_departments = state_data.get("recent_departments") or {}
+    override = recent_departments.get(str(answer_id)) if data else None
+    if data:
+        data = prepare_attempt_for_export(data, override)
 
     # 🔹 ЗАГРУЖАЕМ/ПРИВОДИМ ФОТО К ЛОКАЛЬНЫМ ПУТЯМ
     await _hydrate_photos_for_attempt(data, callback.bot)
