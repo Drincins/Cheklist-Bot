@@ -1,12 +1,14 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Boolean, DateTime, JSON, Table, Index, Text
+﻿from sqlalchemy import Column, Integer, String, ForeignKey, Boolean, DateTime, JSON, Table, Index, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from checklist.db.base import Base
 from checklist.db.models.role import position_checklist_access
 
 
+
 class Checklist(Base):
     __tablename__ = "checklists"
+
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
@@ -19,6 +21,7 @@ class Checklist(Base):
     positions = relationship(
         "Position",
         secondary=position_checklist_access,
+        back_populates="checklists",
         back_populates="checklists",
     )
 
@@ -61,6 +64,7 @@ class ChecklistSection(Base):
 class ChecklistQuestion(Base):
     __tablename__ = "checklist_questions"
 
+
     id = Column(Integer, primary_key=True)
     checklist_id = Column(Integer, ForeignKey("checklists.id", ondelete="CASCADE"), nullable=False)
 
@@ -97,6 +101,7 @@ class ChecklistAnswer(Base):
     """
     __tablename__ = "checklist_answers"
 
+
     id = Column(Integer, primary_key=True)
     checklist_id = Column(Integer, ForeignKey("checklists.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -123,6 +128,7 @@ class ChecklistAnswer(Base):
 class ChecklistQuestionAnswer(Base):
     __tablename__ = "checklist_question_answers"
 
+
     id = Column(Integer, primary_key=True)
     answer_id = Column(Integer, ForeignKey("checklist_answers.id", ondelete="CASCADE"), nullable=False)
     question_id = Column(Integer, ForeignKey("checklist_questions.id", ondelete="CASCADE"), nullable=False)
@@ -131,6 +137,7 @@ class ChecklistQuestionAnswer(Base):
     comment = Column(String, nullable=True)          # Комментарий пользователя
     photo_path = Column(String, nullable=True)       # file_id из Telegram или путь к фото
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
     __table_args__ = (
         Index("ix_cqa_answer_id", "answer_id"),

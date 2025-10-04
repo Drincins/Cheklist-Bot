@@ -1,4 +1,4 @@
-import os
+﻿import os
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
@@ -7,6 +7,7 @@ import streamlit as st
 from sqlalchemy.orm import Session
 
 from checklist.db.db import SessionLocal
+from bot.config import BOT_TOKEN
 from checklist.db.models import (
     Checklist,
     ChecklistAnswer,

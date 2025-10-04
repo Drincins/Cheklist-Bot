@@ -1,10 +1,15 @@
 from aiogram.fsm.state import State, StatesGroup
 
 class Form(StatesGroup):
-    entering_phone = State()
+    entering_login = State()
+    entering_password = State()
+    awaiting_confirmation = State()
+    selecting_department = State()
+    entering_custom_department = State()
+    choosing_checklist_mode = State()
     show_checklists = State()
     answering_question = State()
     adding_comment = State()
     adding_photo = State()
-    entering_name = State()
     manual_text_answer = State()
+    text_decision = State()

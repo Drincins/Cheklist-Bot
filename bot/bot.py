@@ -10,7 +10,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
 # Роутеры
-from .handlers import start, fsm, checklist, fallback
+from .handlers import start, fsm_auth, checklist, fsm_completed, fallback
 
 # Пытаемся взять токен из config.py, иначе — из .env / окружения
 BOT_TOKEN = None
@@ -40,8 +40,9 @@ def setup_logging() -> None:
 def build_dispatcher() -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(start.router)
-    dp.include_router(fsm.router)
+    dp.include_router(fsm_auth.router)
     dp.include_router(checklist.router)
+    dp.include_router(fsm_completed.router)
     dp.include_router(fallback.router)
     return dp
 

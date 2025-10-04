@@ -18,6 +18,8 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment, Font
 
+from ..utils.timezone import format_moscow, to_moscow
+
 @dataclass
 class AnswerRow:
     number: int
@@ -34,8 +36,13 @@ class AttemptData:
     checklist_name: str
     user_name: str
     company_name: Optional[str]
+    department: Optional[str] = None
     submitted_at: dt.datetime
     answers: List[AnswerRow]
+    total_score: Optional[float] = None
+    total_max: Optional[float] = None
+    percent: Optional[float] = None
+    is_scored: bool = False
 
 def _register_font():
     font_path = os.path.join("assets", "fonts", "DejaVuSans.ttf")
@@ -59,7 +66,7 @@ def _auto_fit_columns(ws):
         ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
 
 def _fmt_dt(d: dt.datetime) -> str:
-    return d.strftime("%Y-%m-%d %H:%M")
+    return format_moscow(d, "%Y-%m-%d %H:%M")
 
 def export_attempt_to_pdf(filename: str, data: AttemptData):
     font_name = _register_font()
@@ -174,7 +181,8 @@ def export_attempt_to_files(tmp_dir: Optional[str], data: AttemptData):
     base_dir = tmp_dir or tempfile.gettempdir()
     safe_user = data.user_name.replace(" ", "_")
     safe_check = data.checklist_name.replace(" ", "_")
-    stamp = data.submitted_at.strftime("%Y%m%d_%H%M")
+    local_dt = to_moscow(data.submitted_at) or data.submitted_at
+    stamp = local_dt.strftime("%Y%m%d_%H%M")
     pdf_path = os.path.join(base_dir, f"report_{safe_check}_{safe_user}_{stamp}.pdf")
     xlsx_path = os.path.join(base_dir, f"report_{safe_check}_{safe_user}_{stamp}.xlsx")
 
