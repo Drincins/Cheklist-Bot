@@ -3,7 +3,10 @@ import html
 import logging
 import os
 import uuid
+from datetime import datetime
 from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiogram import Router, types, F, Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -41,6 +44,9 @@ _RESERVED_TEXT_COMMANDS = {
     "ℹ️ обо мне",
 }
 
+_YESNO_TYPES = {"yesno", "yes_no", "boolean", "bool", "yn"}
+_SCALE_TYPES = {"scale", "rating"}
+
 
 def _escape(text: str | None) -> str:
     return html.escape(text or "")
@@ -53,6 +59,69 @@ def _fmt_points(value) -> str:
         return str(value)
     text = f"{num:.2f}".rstrip("0").rstrip(".")
     return text or "0"
+
+
+def _is_answer_filled(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _count_answered(answers_map: dict[int, dict]) -> int:
+    count = 0
+    for draft in answers_map.values():
+        if not isinstance(draft, dict):
+            continue
+        if _is_answer_filled(draft.get("answer")):
+            count += 1
+    return count
+
+
+def _normalize_answers_map(raw: dict | None) -> dict[int, dict[str, Any]]:
+    normalized: dict[int, dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for key, draft in raw.items():
+            try:
+                qid = int(key)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(draft, dict):
+                draft = {"answer": draft, "comment": None, "photo_path": None}
+            normalized[qid] = {
+                "answer": draft.get("answer"),
+                "comment": draft.get("comment"),
+                "photo_path": draft.get("photo_path"),
+            }
+    return normalized
+
+
+def _first_unanswered_index(questions: list[dict], answers_map: dict[int, dict]) -> int:
+    for idx, question in enumerate(questions):
+        qid = question.get("id")
+        if qid is None:
+            continue
+        draft = answers_map.get(qid, {})
+        if not isinstance(draft, dict):
+            draft = {}
+        if not _is_answer_filled(draft.get("answer")):
+            return idx
+    return len(questions)
+
+
+def _first_unanswered_block_index(sections: list[dict], answers_map: dict[int, dict]) -> int:
+    for idx, section in enumerate(sections):
+        for question in section.get("items", []):
+            qid = question.get("id")
+            if qid is None:
+                continue
+            draft = answers_map.get(qid, {})
+            if not isinstance(draft, dict):
+                draft = {}
+            if not _is_answer_filled(draft.get("answer")):
+                return idx
+    return 0
 
 
 async def _store_photo_locally(bot: Bot, file_id: str, attempt_id: int | None, question_id: int) -> str | None:
@@ -134,6 +203,32 @@ async def start_checklist(callback: types.CallbackQuery, state: FSMContext):
     checklists_map = data.get("checklists_map", {})
     checklist_name = checklists_map.get(str(checklist_id)) or f"Чек-лист #{checklist_id}"
 
+    draft_attempt_id = None
+    existing_attempt_id = data.get("attempt_id")
+    existing_checklist_id = data.get("checklist_id") or data.get("pending_checklist_id")
+    if existing_attempt_id and existing_checklist_id == checklist_id:
+        draft_attempt_id = existing_attempt_id
+    else:
+        draft_attempt_id = await asyncio.to_thread(
+            checklists_service.find_draft_attempt,
+            user_id,
+            checklist_id,
+        )
+    answered_count = None
+    answers_from_draft: dict[int, dict[str, Any]] = {}
+    draft_department = None
+    if draft_attempt_id:
+        draft_answers = await asyncio.to_thread(
+            checklists_service.get_attempt_answers,
+            draft_attempt_id,
+        )
+        answers_from_draft = _normalize_answers_map(draft_answers)
+        answered_count = _count_answered(answers_from_draft)
+        draft_department = await asyncio.to_thread(
+            checklists_service.get_draft_department,
+            draft_attempt_id,
+        )
+
     user = data.get("user", {})
     departments = user.get("departments") or []
     departments = [d for d in departments if d]
@@ -144,30 +239,125 @@ async def start_checklist(callback: types.CallbackQuery, state: FSMContext):
         pending_checklist_id=checklist_id,
         checklist_name=checklist_name,
         questions=questions,
-        answers_map={},
+        question_map={q.get("id"): q for q in questions if q.get("id") is not None},
+        answers_map=answers_from_draft if answers_from_draft else {},
         current=0,
         attempt_id=None,
         department_options=departments,
-        selected_department=None,
+        selected_department=draft_department,
         q_msg_id=None,
         next_actions_msg_id=None,
+        exit_confirm_message_id=None,
+        block_sections=None,
+        block_question_messages={},
+        block_header_message_id=None,
+        block_nav_message_id=None,
+        resume_attempt_id=draft_attempt_id,
+        resume_prompt_message_id=None,
+        resume_answered_count=answered_count,
     )
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if draft_attempt_id:
+        total_questions = len(questions)
+        resume_lines = [
+            f"⏸ У вас уже есть незавершённое прохождение «{_escape(checklist_name)}»."
+        ]
+        if answered_count:
+            resume_lines.append(f"Заполнено: {answered_count} из {total_questions} вопросов.")
+        else:
+            resume_lines.append(f"Всего вопросов: {total_questions}. Ответы ещё не сохранены.")
+        if draft_department:
+            resume_lines.append(f"Выбрано подразделение: {_escape(draft_department)}")
+        resume_lines.append("Продолжить или начать заново?")
+        prompt = await callback.message.answer(
+            "\n".join(resume_lines),
+            reply_markup=_build_resume_keyboard(),
+            parse_mode="HTML",
+        )
+        await state.update_data(resume_prompt_message_id=prompt.message_id)
+        await state.set_state(Form.confirming_resume)
+        await callback.answer()
+        return
 
     await _prompt_department_choice(callback.message, state)
     await callback.answer()
+
+
+@router.callback_query(F.data == "resume:continue", Form.confirming_resume)
+async def handle_resume_continue(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await _safe_delete(callback.message)
+    data = await state.get_data()
+    await state.update_data(
+        resume_prompt_message_id=None,
+        resume_answered_count=None,
+    )
+    department = data.get("selected_department")
+    if department:
+        await _prompt_mode_selection(callback.message, state, department)
+    else:
+        await _prompt_department_choice(callback.message, state)
+    await callback.answer("Продолжаем заполнение.")
+
+
+@router.callback_query(F.data == "resume:new", Form.confirming_resume)
+async def handle_resume_new(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    attempt_id = data.get("resume_attempt_id")
+    if attempt_id:
+        await asyncio.to_thread(checklists_service.discard, attempt_id)
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await _safe_delete(callback.message)
+    await state.update_data(
+        resume_attempt_id=None,
+        resume_prompt_message_id=None,
+        resume_answered_count=None,
+        attempt_id=None,
+        answers_map={},
+        selected_department=None,
+    )
+
+    await _prompt_department_choice(callback.message, state)
+    await callback.answer("Начинаем заново.")
+
 
 def _question_text(question: dict, draft: dict) -> str:
     """Текст вопроса + индикаторы введённых данных."""
     base = _escape(str(question.get("text", "")))
     parts = [base]
 
-    req_flags = []
-    if question.get("require_comment"):
-        req_flags.append("💬 Требуется комментарий")
-    if question.get("require_photo"):
-        req_flags.append("📷 Требуется фото")
-    if req_flags:
-        parts.append("\n".join(req_flags))
+    comment_required = bool(question.get("require_comment"))
+    photo_required = bool(question.get("require_photo"))
+    comment_present = bool(draft.get("comment"))
+    photo_present = bool(draft.get("photo_path"))
+
+    req_lines: list[str] = []
+    if comment_required:
+        if comment_present:
+            req_lines.append("✅ Комментарий добавлен")
+        else:
+            req_lines.append("💬 Требуется комментарий")
+    if photo_required:
+        if photo_present:
+            req_lines.append("✅ Фото добавлено")
+        else:
+            req_lines.append("📷 Требуется фото")
+    if req_lines:
+        parts.append("\n".join(req_lines))
 
     extra = []
     answer = draft.get("answer")
@@ -194,14 +384,35 @@ def _question_text(question: dict, draft: dict) -> str:
                 emoji = "🟪"
 
             extra.append(f"{emoji} Ответ: <b>{_escape(answer_str)}</b>")
-    if draft.get("comment"):
+    if comment_present and not comment_required:
         extra.append("💬 Комментарий добавлен")
-    if draft.get("photo_path"):
+    if photo_present and not photo_required:
         extra.append("📷 Фото добавлено")
     if extra:
         parts.append("\n".join(extra))
 
     return "\n\n".join(parts)
+
+
+def _resolve_question(data: dict, qid: int | None = None) -> tuple[int | None, dict | None]:
+    """Находит вопрос по id или по текущему индексу."""
+    questions = data.get("questions") or []
+    question_map: dict | None = data.get("question_map")
+
+    if qid is not None:
+        if question_map and qid in question_map:
+            return qid, question_map[qid]
+        for item in questions:
+            if item.get("id") == qid:
+                return qid, item
+        return None, None
+
+    current = data.get("current")
+    if current is not None and 0 <= current < len(questions):
+        question = questions[current]
+        return question.get("id"), question
+
+    return None, None
 
 def _answers_summary_text(
     questions: list[dict],
@@ -278,7 +489,6 @@ def build_question_keyboard(question_type: str, current: int, selected: str | No
     rows.append([
         InlineKeyboardButton(text="➡️ Далее", callback_data="continue_after_extra"),
     ])
-    # новая кнопка в самом низу
     rows.append([
         InlineKeyboardButton(text="⬅️ Назад к предыдущему", callback_data="prev_question"),
     ])
@@ -301,7 +511,8 @@ def _build_department_keyboard(options: list[str]) -> InlineKeyboardMarkup:
 def _build_mode_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👀 Показать весь чек-лист", callback_data="mode:full")],
-        [InlineKeyboardButton(text="▶️ Начать прохождение", callback_data="mode:start")],
+        [InlineKeyboardButton(text="▶️ Пройти по порядку", callback_data="mode:start")],
+        [InlineKeyboardButton(text="🔠 Пройти по блокам", callback_data="mode:blocks")],
         [InlineKeyboardButton(text="⬅️ Выбрать другой объект", callback_data="mode:back")],
     ])
 
@@ -355,10 +566,586 @@ def _build_full_preview_keyboard(index: int, total: int) -> InlineKeyboardMarkup
             InlineKeyboardButton(text="1/1", callback_data="mode:full_page:noop"),
         ])
 
-    rows.append([InlineKeyboardButton(text="▶️ Начать чек-лист", callback_data="mode:start")])
+    rows.append([InlineKeyboardButton(text="▶️ Пройти по порядку", callback_data="mode:start")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="mode:full_back")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_block_question_keyboard(question: dict, qid: int, draft: dict) -> InlineKeyboardMarkup:
+    """Клавиатура для режима прохождения по блокам."""
+    answer = draft.get("answer")
+    answer_str = str(answer).lower() if answer is not None else None
+    comment = draft.get("comment")
+    photo = draft.get("photo_path")
+    qtype = (question.get("type") or "").lower().strip()
+
+    def mark(label: str, match: str) -> str:
+        if answer_str is None:
+            return label
+        if match in {"yes", "no"}:
+            return f"{label}✔" if answer_str == match else label
+        return f"{label}✔" if str(answer) == match else label
+
+    comment_label = "💬✔" if comment else "💬"
+    photo_label = "📷✔" if photo else "📷"
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if qtype in _YESNO_TYPES:
+        rows.append([
+            InlineKeyboardButton(text=mark("✅", "yes"), callback_data=f"block_answer:{qid}:yes"),
+            InlineKeyboardButton(text=mark("❌", "no"), callback_data=f"block_answer:{qid}:no"),
+            InlineKeyboardButton(text=comment_label, callback_data=f"block_comment:{qid}"),
+            InlineKeyboardButton(text=photo_label, callback_data=f"block_photo:{qid}"),
+        ])
+    elif qtype in _SCALE_TYPES:
+        rows.append([
+            InlineKeyboardButton(text=mark(str(i), str(i)), callback_data=f"block_answer:{qid}:{i}")
+            for i in range(1, 6)
+        ])
+        rows.append([
+            InlineKeyboardButton(text=comment_label, callback_data=f"block_comment:{qid}"),
+            InlineKeyboardButton(text=photo_label, callback_data=f"block_photo:{qid}"),
+        ])
+    else:
+        answer_label = "✍️✔" if answer not in (None, "") else "✍️"
+        rows.append([
+            InlineKeyboardButton(text=answer_label, callback_data=f"block_answer:{qid}:text"),
+            InlineKeyboardButton(text=comment_label, callback_data=f"block_comment:{qid}"),
+            InlineKeyboardButton(text=photo_label, callback_data=f"block_photo:{qid}"),
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_block_nav_keyboard(index: int, total: int) -> InlineKeyboardMarkup:
+    prev_cb = "block_nav:prev" if index > 0 else "block_nav:noop_prev"
+    next_cb = "block_nav:next" if index < total - 1 else "block_nav:noop_next"
+    nav_row = [
+        InlineKeyboardButton(text="⬅️", callback_data=prev_cb),
+        InlineKeyboardButton(text=f"{index + 1}/{total}", callback_data="block_nav:noop_info"),
+        InlineKeyboardButton(text="➡️", callback_data=next_cb),
+    ]
+    rows = [
+        nav_row,
+        [InlineKeyboardButton(text="✅ Завершить", callback_data="block_finish")],
+        [InlineKeyboardButton(text="🚪 Выйти", callback_data="exit_attempt")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _delete_block_question_messages(bot: Bot, chat_id: int, data: dict) -> None:
+    raw = data.get("block_question_messages") or {}
+    if isinstance(raw, dict):
+        message_ids = list(raw.values())
+    elif isinstance(raw, list):
+        message_ids = raw
+    else:
+        message_ids = []
+
+    for msg_id in message_ids:
+        if not msg_id:
+            continue
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+
+
+async def _delete_block_nav_message(bot: Bot, chat_id: int, data: dict) -> None:
+    msg_id = data.get("block_nav_message_id")
+    if not msg_id:
+        return
+
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
+
+
+async def _render_block(base_message: types.Message, state: FSMContext, target_index: int) -> None:
+    data = await state.get_data()
+    sections = data.get("block_sections") or []
+    if not sections:
+        await base_message.answer("Нет доступных блоков для этого чек-листа.")
+        return
+
+    total = len(sections)
+    index = max(0, min(target_index, total - 1))
+    section = sections[index]
+
+    bot = base_message.bot
+    chat_id = base_message.chat.id
+
+    await _delete_block_nav_message(bot, chat_id, data)
+    await _delete_block_question_messages(bot, chat_id, data)
+
+    header_lines = [
+        f"📂 Блок {index + 1} из {total}",
+        f"<b>{_escape(section.get('title') or 'Без раздела')}</b>",
+    ]
+    count = len(section.get("items") or [])
+    header_lines.append(f"Всего вопросов: {count}")
+    header_text = "\n".join(header_lines)
+    keyboard = _build_block_nav_keyboard(index, total)
+
+    header_msg: types.Message | None = None
+    header_id = data.get("block_header_message_id")
+
+    if header_id:
+        try:
+            header_msg = await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=header_id,
+                text=header_text,
+                reply_markup=None,
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest:
+            try:
+                header_msg = await bot.send_message(
+                    chat_id,
+                    header_text,
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest:
+                header_msg = await base_message.answer(
+                    header_text,
+                    parse_mode="HTML",
+                )
+    else:
+        try:
+            header_msg = await base_message.edit_text(
+                header_text,
+                reply_markup=None,
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest:
+            header_msg = await base_message.answer(
+                header_text,
+                parse_mode="HTML",
+            )
+            try:
+                await _safe_delete(base_message)
+            except Exception:
+                pass
+
+    if header_msg is None:
+        header_msg = await base_message.answer(
+            header_text,
+            parse_mode="HTML",
+        )
+        header_id = header_msg.message_id
+    else:
+        header_id = header_msg.message_id
+
+    answers_map = _normalize_answers_map(data.get("answers_map"))
+    question_messages: dict[str, int] = {}
+
+    for question in section.get("items", []):
+        qid = question.get("id")
+        if qid is None:
+            continue
+        draft = answers_map.setdefault(qid, {"answer": None, "comment": None, "photo_path": None})
+        text = _question_text(question, draft)
+        kb = _build_block_question_keyboard(question, qid, draft)
+        sent = await header_msg.answer(text, reply_markup=kb, parse_mode="HTML")
+        question_messages[str(qid)] = sent.message_id
+
+    try:
+        nav_msg = await header_msg.answer(
+            "Навигация по блокам:",
+            reply_markup=keyboard,
+        )
+        nav_id = nav_msg.message_id
+    except TelegramBadRequest:
+        nav_id = None
+
+    await state.update_data(
+        block_index=index,
+        block_header_message_id=header_id,
+        block_nav_message_id=nav_id,
+        block_question_messages=question_messages,
+        answers_map=answers_map,
+        active_question_id=None,
+        return_state=None,
+    )
+
+
+async def _refresh_block_question(message: types.Message, state: FSMContext, qid: int) -> None:
+    data = await state.get_data()
+    _, question = _resolve_question(data, qid)
+    if not question:
+        return
+
+    answers_map = _normalize_answers_map(data.get("answers_map"))
+    draft = answers_map.setdefault(qid, {"answer": None, "comment": None, "photo_path": None})
+
+    mapping = data.get("block_question_messages") or {}
+    if isinstance(mapping, dict):
+        msg_id = mapping.get(str(qid)) or mapping.get(qid)
+    else:
+        msg_id = None
+
+    if not msg_id:
+        msg_id = getattr(message, "message_id", None)
+
+    if not msg_id:
+        return
+
+    kb = _build_block_question_keyboard(question, qid, draft)
+    text = _question_text(question, draft)
+
+    try:
+        await message.bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=msg_id,
+            text=text,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest:
+        try:
+            await message.bot.edit_message_reply_markup(
+                chat_id=message.chat.id,
+                message_id=msg_id,
+                reply_markup=kb,
+            )
+        except TelegramBadRequest:
+            pass
+
+    await state.update_data(answers_map=answers_map, active_question_id=None, return_state=None)
+
+
+async def _finalize_attempt(message: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await _clear_exit_confirmation(message.bot, message.chat.id, data, state)
+    questions = data.get("questions") or []
+    answers_map = _normalize_answers_map(data.get("answers_map"))
+    attempt_id = data.get("attempt_id")
+    selected_department = data.get("selected_department")
+
+    attempt_data = None
+    if attempt_id:
+        final_attempt_id = await asyncio.to_thread(checklists_service.finish, attempt_id)
+        if final_attempt_id:
+            attempt_id = final_attempt_id
+            try:
+                attempt_data = await asyncio.to_thread(get_attempt_data, final_attempt_id)
+            except Exception as exc:
+                logger.warning("[CHECKLIST] get_attempt_data failed for attempt_id=%s: %s", final_attempt_id, exc)
+        else:
+            attempt_id = None
+
+    await message.answer("✅ Чек-лист завершён. Спасибо!")
+
+    if attempt_data and selected_department:
+        attempt_data.department = selected_department
+
+    info_lines = []
+    if attempt_data:
+        info_lines.append(f"📋 <b>{_escape(attempt_data.checklist_name)}</b>")
+        info_lines.append(f"Дата: {attempt_data.submitted_at:%d.%m.%Y %H:%M}")
+        if attempt_data.department:
+            info_lines.append(f"Подразделение: {_escape(attempt_data.department)}")
+        result_line = format_attempt_result(attempt_data)
+        if attempt_data.is_scored and result_line:
+            info_lines.append(f"Результат: {_escape(result_line)}")
+    else:
+        if selected_department:
+            info_lines.append(f"Подразделение: {_escape(selected_department)}")
+        info_lines.append("Результаты доступны ниже.")
+
+    if info_lines:
+        await message.answer("\n".join(info_lines), parse_mode="HTML")
+
+    summary_text = _answers_summary_text(questions, answers_map, attempt_data=attempt_data)
+
+    keyboard_rows = []
+    if attempt_id:
+        keyboard_rows.append([
+            InlineKeyboardButton(text="📄 PDF", callback_data=f"completed_pdf:{attempt_id}:0"),
+            InlineKeyboardButton(text="📊 Excel", callback_data=f"completed_excel:{attempt_id}:0"),
+        ])
+    keyboard_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="checklist_continue")])
+
+    summary_kb = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    summary_msg = await message.answer(summary_text, parse_mode="HTML", reply_markup=summary_kb)
+
+    recent_departments = data.get("recent_departments") or {}
+    if attempt_id and selected_department:
+        recent_departments[str(attempt_id)] = selected_department
+
+    await state.update_data(
+        next_actions_msg_id=summary_msg.message_id,
+        attempt_data=attempt_data,
+        recent_departments=recent_departments,
+        pending_text=None,
+        pending_text_msg_id=None,
+        q_msg_id=None,
+        block_sections=None,
+        block_question_messages={},
+        block_header_message_id=None,
+        block_nav_message_id=None,
+        block_index=None,
+        mode=None,
+        active_question_id=None,
+        return_state=None,
+        exit_confirm_message_id=None,
+        attempt_id=attempt_id,
+        resume_attempt_id=None,
+        resume_prompt_message_id=None,
+        resume_answered_count=None,
+    )
+    await state.set_state(Form.show_checklists)
+
+
+
+
+@router.callback_query(F.data == "exit_attempt", Form.answering_question)
+@router.callback_query(F.data == "exit_attempt", Form.answering_block)
+@router.callback_query(F.data == "exit_attempt", Form.manual_text_answer)
+@router.callback_query(F.data == "exit_attempt", Form.adding_comment)
+@router.callback_query(F.data == "exit_attempt", Form.adding_photo)
+async def handle_exit_attempt(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    attempt_id = data.get("attempt_id")
+    if not attempt_id:
+        await callback.answer("Нет активной попытки.", show_alert=True)
+        return
+
+    await callback.answer("Вы уверены? Прогресс будет потерян.", show_alert=True)
+
+    await _clear_exit_confirmation(callback.message.bot, callback.message.chat.id, data, state)
+
+    confirm_msg = await callback.message.answer(
+        "❓ Выйти из прохождения чек-листа?",
+        reply_markup=_build_exit_confirmation_keyboard(),
+    )
+    await state.update_data(exit_confirm_message_id=confirm_msg.message_id)
+
+
+@router.callback_query(F.data == "exit_confirm", Form.answering_question)
+@router.callback_query(F.data == "exit_confirm", Form.answering_block)
+@router.callback_query(F.data == "exit_confirm", Form.manual_text_answer)
+@router.callback_query(F.data == "exit_confirm", Form.adding_comment)
+@router.callback_query(F.data == "exit_confirm", Form.adding_photo)
+async def handle_exit_confirm(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer("Выход выполнен.")
+    await _abort_attempt(callback.message, state)
+
+
+@router.callback_query(F.data == "exit_cancel", Form.answering_question)
+@router.callback_query(F.data == "exit_cancel", Form.answering_block)
+@router.callback_query(F.data == "exit_cancel", Form.manual_text_answer)
+@router.callback_query(F.data == "exit_cancel", Form.adding_comment)
+@router.callback_query(F.data == "exit_cancel", Form.adding_photo)
+async def handle_exit_cancel(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await _clear_exit_confirmation(callback.message.bot, callback.message.chat.id, data, state)
+    await callback.answer("Продолжаем заполнение.")
+
+
+@router.callback_query(F.data.startswith("block_answer:"), Form.answering_block)
+async def handle_block_answer(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        _, qid_raw, value = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer()
+        return
+
+    try:
+        qid = int(qid_raw)
+    except ValueError:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    _, question = _resolve_question(data, qid)
+    if not question:
+        await callback.answer("Вопрос не найден", show_alert=True)
+        return
+
+    if value == "text":
+        await state.update_data(active_question_id=qid, return_state=Form.answering_block)
+        await state.set_state(Form.manual_text_answer)
+        try:
+            await callback.message.edit_text(
+                "✍️ Введите ваш ответ текстом:",
+                reply_markup=build_submode_keyboard(),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                "✍️ Введите ваш ответ текстом:",
+                reply_markup=build_submode_keyboard(),
+            )
+        await callback.answer()
+        return
+
+    answers_map = _normalize_answers_map(data.get("answers_map"))
+    draft = answers_map.setdefault(qid, {"answer": None, "comment": None, "photo_path": None})
+    draft["answer"] = value
+    answers_map[qid] = draft
+
+    await state.update_data(answers_map=answers_map, active_question_id=None, return_state=None)
+
+    attempt_id = data.get("attempt_id")
+    if attempt_id:
+        await asyncio.to_thread(checklists_service.save_answer, attempt_id, qid, value)
+
+    await _refresh_block_question(callback.message, state, qid)
+    await state.set_state(Form.answering_block)
+    await callback.answer("Ответ сохранён")
+
+
+@router.callback_query(F.data.startswith("block_comment:"), Form.answering_block)
+async def handle_block_comment(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        qid = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    answers_map = _normalize_answers_map(data.get("answers_map"))
+    answers_map.setdefault(qid, {"answer": None, "comment": None, "photo_path": None})
+    await state.update_data(
+        answers_map=answers_map,
+        active_question_id=qid,
+        return_state=Form.answering_block,
+        submode="comment",
+    )
+
+    await state.set_state(Form.adding_comment)
+    try:
+        await callback.message.edit_text(
+            "💬 Введите ваш комментарий:",
+            reply_markup=build_submode_keyboard(),
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(
+            "💬 Введите ваш комментарий:",
+            reply_markup=build_submode_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("block_photo:"), Form.answering_block)
+async def handle_block_photo(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        qid = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    answers_map = _normalize_answers_map(data.get("answers_map"))
+    answers_map.setdefault(qid, {"answer": None, "comment": None, "photo_path": None})
+    await state.update_data(
+        answers_map=answers_map,
+        active_question_id=qid,
+        return_state=Form.answering_block,
+        submode="photo",
+    )
+
+    await state.set_state(Form.adding_photo)
+    try:
+        await callback.message.edit_text(
+            "📷 Отправьте фото:",
+            reply_markup=build_submode_keyboard(),
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(
+            "📷 Отправьте фото:",
+            reply_markup=build_submode_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("block_nav:"), Form.answering_block)
+async def handle_block_navigation(callback: types.CallbackQuery, state: FSMContext):
+    action = callback.data.split(":", 1)[1]
+
+    if action.startswith("noop") or action == "noop_info":
+        if action == "noop_prev":
+            await callback.answer("Это первый блок", show_alert=True)
+        elif action == "noop_next":
+            await callback.answer("Это последний блок", show_alert=True)
+        else:
+            await callback.answer()
+        return
+
+    data = await state.get_data()
+    current = data.get("block_index") or 0
+    sections = data.get("block_sections") or []
+
+    if action == "prev":
+        target = current - 1
+        if target < 0:
+            await callback.answer("Это первый блок", show_alert=True)
+            return
+    elif action == "next":
+        target = current + 1
+        if target >= len(sections):
+            await callback.answer("Это последний блок", show_alert=True)
+            return
+    else:
+        await callback.answer()
+        return
+
+    await _render_block(callback.message, state, target)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "block_finish", Form.answering_block)
+async def handle_block_finish(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    questions = data.get("questions") or []
+    answers_map = _normalize_answers_map(data.get("answers_map"))
+
+    for idx, question in enumerate(questions, start=1):
+        qid = question.get("id")
+        if qid is None:
+            continue
+        draft = answers_map.get(qid, {})
+        answer = draft.get("answer")
+        has_answer = answer is not None
+        if isinstance(answer, str):
+            has_answer = bool(answer.strip())
+
+        title = (question.get("text") or question.get("question_text") or "").strip() or f"Вопрос #{idx}"
+
+        if not has_answer:
+            await callback.answer(f"Ответьте на вопрос: {title}", show_alert=True)
+            return
+
+        comment = draft.get("comment")
+        if question.get("require_comment") and not (comment and str(comment).strip()):
+            await callback.answer(f"Добавьте обязательный комментарий к вопросу: {title}", show_alert=True)
+            return
+
+        if question.get("require_photo") and not draft.get("photo_path"):
+            await callback.answer(f"Добавьте обязательное фото к вопросу: {title}", show_alert=True)
+            return
+
+    await _delete_block_question_messages(callback.message.bot, callback.message.chat.id, data)
+
+    header_msg_id = data.get("block_header_message_id")
+    if header_msg_id:
+        try:
+            await callback.message.bot.delete_message(callback.message.chat.id, header_msg_id)
+        except Exception:
+            pass
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _safe_delete(callback.message)
+
+    await _finalize_attempt(callback.message, state)
+    await callback.answer()
 
 
 def _build_text_choice_keyboard() -> InlineKeyboardMarkup:
@@ -371,31 +1158,207 @@ def _build_text_choice_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _build_resume_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Продолжить", callback_data="resume:continue")],
+        [InlineKeyboardButton(text="🆕 Начать заново", callback_data="resume:new")],
+    ])
+
+
+def _build_exit_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Выйти", callback_data="exit_confirm")],
+        [InlineKeyboardButton(text="↩️ Остаться", callback_data="exit_cancel")],
+    ])
+
+
+async def _clear_exit_confirmation(bot: Bot, chat_id: int, data: dict, state: FSMContext) -> None:
+    msg_id = data.get("exit_confirm_message_id")
+    if not msg_id:
+        return
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
+    await state.update_data(exit_confirm_message_id=None)
+
+
+async def _abort_attempt(message: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    bot = message.bot
+    chat_id = message.chat.id
+
+    await _clear_exit_confirmation(bot, chat_id, data, state)
+
+    attempt_id = data.get("attempt_id")
+    if attempt_id:
+        await asyncio.to_thread(checklists_service.discard, attempt_id)
+
+    q_msg_id = data.get("q_msg_id")
+    if q_msg_id:
+        try:
+            await bot.delete_message(chat_id, q_msg_id)
+        except Exception:
+            pass
+
+    pending_text_msg_id = data.get("pending_text_msg_id")
+    if pending_text_msg_id:
+        try:
+            await bot.delete_message(chat_id, pending_text_msg_id)
+        except Exception:
+            pass
+
+    next_actions_msg_id = data.get("next_actions_msg_id")
+    if next_actions_msg_id:
+        try:
+            await bot.delete_message(chat_id, next_actions_msg_id)
+        except Exception:
+            pass
+
+    await _delete_block_question_messages(bot, chat_id, data)
+    await _delete_block_nav_message(bot, chat_id, data)
+
+    header_id = data.get("block_header_message_id")
+    if header_id:
+        try:
+            await bot.delete_message(chat_id, header_id)
+        except Exception:
+            pass
+
+    await state.update_data(
+        attempt_id=None,
+        attempt_data=None,
+        answers_map={},
+        current=None,
+        pending_text=None,
+        pending_text_msg_id=None,
+        next_actions_msg_id=None,
+        q_msg_id=None,
+        block_sections=None,
+        block_question_messages={},
+        block_header_message_id=None,
+        block_nav_message_id=None,
+        block_index=None,
+        mode=None,
+        active_question_id=None,
+        return_state=None,
+        exit_confirm_message_id=None,
+        checklist_id=None,
+        questions=None,
+        question_map=None,
+        pending_checklist_id=None,
+        selected_department=None,
+        resume_attempt_id=None,
+        resume_prompt_message_id=None,
+        resume_answered_count=None,
+    )
+
+    await state.set_state(Form.show_checklists)
+
+    await message.answer("❌ Прохождение отменено. Прогресс удалён.")
+
+    user_id = data.get("user_id")
+    if user_id:
+        checklists = await asyncio.to_thread(auth_service.get_user_checklists, user_id)
+        if checklists:
+            await state.update_data(
+                checklists_map={str(c["id"]): c["name"] for c in checklists},
+            )
+            await message.answer("Выберите чек-лист:", reply_markup=get_checklists_keyboard(checklists))
+        else:
+            await message.answer("У вас пока нет доступных чек-листов.")
+    else:
+        await send_main_menu(message)
+
 async def _prompt_department_choice(message: types.Message, state: FSMContext):
     data = await state.get_data()
     options = data.get("department_options") or []
     checklist_name = data.get("checklist_name") or "чек-лист"
     if options:
         kb = _build_department_keyboard(options)
-        await message.answer(
+        sent = await message.answer(
             f"🏢 Выберите объект/подразделение для «{_escape(checklist_name)}»:",
             reply_markup=kb,
             parse_mode="HTML",
         )
+        await state.update_data(department_prompt_message_id=sent.message_id, checklist_start_dt=None)
         await state.set_state(Form.selecting_department)
     else:
-        await message.answer("🏢 Укажите название объекта (введите текст):")
+        sent = await message.answer("🏢 Укажите название объекта (введите текст):")
+        await state.update_data(department_prompt_message_id=sent.message_id, checklist_start_dt=None)
         await state.set_state(Form.entering_custom_department)
 
 
 async def _prompt_mode_selection(message: types.Message, state: FSMContext, department: str):
     data = await state.get_data()
     checklist_name = data.get("checklist_name") or "чек-лист"
+
+    tz_msk = ZoneInfo("Europe/Moscow")
+    started_at_raw = data.get("checklist_start_dt")
+    started_at = None
+
+    if started_at_raw:
+        try:
+            parsed = datetime.fromisoformat(started_at_raw)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                started_at = parsed.replace(tzinfo=tz_msk)
+            else:
+                started_at = parsed.astimezone(tz_msk)
+
+    if started_at is None:
+        started_at = datetime.now(tz_msk)
+
+    started_msk = started_at.astimezone(tz_msk)
+    start_iso = started_msk.isoformat()
+    started_str = started_msk.strftime("%d.%m.%Y %H:%M")
+
     text = (
-        f"🏢 Объект: <b>{_escape(department)}</b>\n\n"
-        f"Как пройти «{_escape(checklist_name)}»?"
+        f"🏢 Выбранный объект: <b>{_escape(department)}</b>\n"
+        f"📋 Чек-лист: <b>{_escape(checklist_name)}</b>\n"
+        f"🕒 Начало заполнения: {started_str} (МСК)\n\n"
+        "Выберите режим прохождения:"
     )
-    await message.answer(text, reply_markup=_build_mode_keyboard(), parse_mode="HTML")
+
+    keyboard = _build_mode_keyboard()
+    updated_message: types.Message | None = None
+
+    try:
+        updated_message = await message.edit_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest:
+        updated_message = None
+
+    if updated_message is None:
+        prompt_msg_id = data.get("department_prompt_message_id")
+        if prompt_msg_id:
+            try:
+                updated_message = await message.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=prompt_msg_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest:
+                updated_message = None
+
+    if updated_message is None:
+        updated_message = await message.answer(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+    await state.update_data(
+        department_prompt_message_id=updated_message.message_id,
+        checklist_start_dt=start_iso,
+    )
     await state.set_state(Form.choosing_checklist_mode)
 
 
@@ -412,7 +1375,11 @@ async def handle_department_choice(callback: types.CallbackQuery, state: FSMCont
         await callback.answer("Не удалось определить подразделение", show_alert=True)
         return
     selected = options[idx]
-    await state.update_data(selected_department=selected)
+    await state.update_data(
+        selected_department=selected,
+        checklist_start_dt=None,
+        department_prompt_message_id=callback.message.message_id,
+    )
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -439,7 +1406,7 @@ async def handle_custom_department(message: types.Message, state: FSMContext):
         await message.answer("Название не может быть пустым. Попробуйте снова.")
         return
 
-    await state.update_data(selected_department=title)
+    await state.update_data(selected_department=title, checklist_start_dt=None)
     await _safe_delete(message)
     await _prompt_mode_selection(message, state, title)
 
@@ -450,7 +1417,11 @@ async def handle_mode_back(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await state.update_data(selected_department=None)
+    await state.update_data(
+        selected_department=None,
+        checklist_start_dt=None,
+        department_prompt_message_id=None,
+    )
     await _prompt_department_choice(callback.message, state)
     await callback.answer()
 
@@ -547,6 +1518,75 @@ async def handle_mode_full_back(callback: types.CallbackQuery, state: FSMContext
     await callback.answer()
 
 
+@router.callback_query(F.data == "mode:blocks", Form.choosing_checklist_mode)
+async def handle_mode_blocks(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    user_id = data.get("user_id")
+    checklist_id = data.get("pending_checklist_id")
+    questions = data.get("questions") or []
+    selected_department = data.get("selected_department")
+
+    if not (user_id and checklist_id and questions):
+        await callback.answer("Не удалось подготовить прохождение по блокам", show_alert=True)
+        return
+
+    attempt_id = await asyncio.to_thread(
+        checklists_service.start_attempt,
+        user_id,
+        checklist_id,
+    )
+    answers_map = await asyncio.to_thread(
+        checklists_service.get_attempt_answers,
+        attempt_id,
+    ) or {}
+    answers_map = _normalize_answers_map(answers_map)
+
+    sections = group_questions_by_section(questions)
+    question_map = data.get("question_map") or {
+        q.get("id"): q for q in questions if q.get("id") is not None
+    }
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    block_start_index = _first_unanswered_block_index(sections, answers_map)
+
+    await state.update_data(
+        checklist_id=checklist_id,
+        attempt_id=attempt_id,
+        answers_map=answers_map,
+        selected_department=selected_department,
+        attempt_data=None,
+        mode="blocks",
+        block_sections=sections,
+        block_index=block_start_index,
+        block_question_messages={},
+        block_header_message_id=None,
+        block_nav_message_id=None,
+        active_question_id=None,
+        return_state=None,
+        question_map=question_map,
+        recent_departments=data.get("recent_departments", {}),
+        exit_confirm_message_id=None,
+        resume_attempt_id=None,
+        resume_prompt_message_id=None,
+        resume_answered_count=None,
+    )
+
+    if selected_department:
+        await asyncio.to_thread(
+            checklists_service.set_draft_department,
+            attempt_id,
+            selected_department,
+        )
+
+    await state.set_state(Form.answering_block)
+    await _render_block(callback.message, state, block_start_index)
+    await callback.answer()
+
+
 @router.callback_query(F.data == "mode:start", Form.choosing_checklist_mode)
 async def handle_mode_start(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -567,19 +1607,36 @@ async def handle_mode_start(callback: types.CallbackQuery, state: FSMContext):
     answers_map = await asyncio.to_thread(
         checklists_service.get_attempt_answers,
         attempt_id,
-    )
+    ) or {}
+    answers_map = _normalize_answers_map(answers_map)
+
+    first_unanswered = _first_unanswered_index(questions, answers_map)
 
     await state.update_data(
         checklist_id=checklist_id,
         attempt_id=attempt_id,
         answers_map=answers_map,
-        current=0,
+        current=first_unanswered,
         selected_department=selected_department,
         attempt_data=None,
         recent_departments=data.get("recent_departments", {}),
         full_preview_sections=None,
         full_preview_index=None,
+        mode="sequence",
+        active_question_id=None,
+        return_state=None,
+        exit_confirm_message_id=None,
+        resume_attempt_id=None,
+        resume_prompt_message_id=None,
+        resume_answered_count=None,
     )
+
+    if selected_department:
+        await asyncio.to_thread(
+            checklists_service.set_draft_department,
+            attempt_id,
+            selected_department,
+        )
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -596,70 +1653,12 @@ async def ask_next_question(message: types.Message, state: FSMContext):
     data = await state.get_data()
     questions = data["questions"]
     current = data["current"]
-    answers_map = data.get("answers_map", {})
+    answers_map = _normalize_answers_map(data.get("answers_map"))
     q_msg_id = data.get("q_msg_id")
 
     # завершение
     if current >= len(questions):
-        attempt_id = data.get("attempt_id")
-        attempt_data = None
-        if attempt_id:
-            await asyncio.to_thread(checklists_service.finish, attempt_id)
-            try:
-                attempt_data = await asyncio.to_thread(get_attempt_data, attempt_id)
-            except Exception as exc:
-                logger.warning("[CHECKLIST] get_attempt_data failed for attempt_id=%s: %s", attempt_id, exc)
-
-        await message.answer("✅ Чек-лист завершён. Спасибо!")
-
-        selected_department = data.get("selected_department")
-        if attempt_data and selected_department:
-            attempt_data.department = selected_department
-
-        info_lines = []
-        if attempt_data:
-            info_lines.append(f"📋 <b>{_escape(attempt_data.checklist_name)}</b>")
-            info_lines.append(f"Дата: {attempt_data.submitted_at:%d.%m.%Y %H:%M}")
-            if attempt_data.department:
-                info_lines.append(f"Подразделение: {_escape(attempt_data.department)}")
-            result_line = format_attempt_result(attempt_data)
-            if attempt_data.is_scored and result_line:
-                info_lines.append(f"Результат: {_escape(result_line)}")
-        else:
-            if selected_department:
-                info_lines.append(f"Подразделение: {_escape(selected_department)}")
-            info_lines.append("Результаты доступны ниже.")
-
-        if info_lines:
-            await message.answer("\n".join(info_lines), parse_mode="HTML")
-
-        summary_text = _answers_summary_text(questions, answers_map, attempt_data=attempt_data)
-
-        keyboard_rows = []
-        if attempt_id:
-            keyboard_rows.append([
-                InlineKeyboardButton(text="📄 PDF", callback_data=f"completed_pdf:{attempt_id}:0"),
-                InlineKeyboardButton(text="📊 Excel", callback_data=f"completed_excel:{attempt_id}:0"),
-            ])
-        keyboard_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="checklist_continue")])
-
-        summary_kb = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-
-        summary_msg = await message.answer(summary_text, parse_mode="HTML", reply_markup=summary_kb)
-
-        recent_departments = data.get("recent_departments") or {}
-        if attempt_id and selected_department:
-            recent_departments[str(attempt_id)] = selected_department
-
-        await state.update_data(
-            next_actions_msg_id=summary_msg.message_id,
-            attempt_data=attempt_data,
-            recent_departments=recent_departments,
-            pending_text=None,
-            pending_text_msg_id=None,
-            q_msg_id=None,
-        )
-        await state.set_state(Form.show_checklists)
+        await _finalize_attempt(message, state)
         return
 
 
@@ -667,7 +1666,7 @@ async def ask_next_question(message: types.Message, state: FSMContext):
     question = questions[current]
     qid = question["id"]
     draft = answers_map.setdefault(qid, {"answer": None, "comment": None, "photo_path": None})
-    await state.update_data(answers_map=answers_map)
+    await state.update_data(answers_map=answers_map, active_question_id=None, return_state=None)
 
     text = _question_text(question, draft)
 
@@ -705,7 +1704,7 @@ async def handle_answer(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     questions = data["questions"]
     current = data["current"]
-    answers_map = data.get("answers_map", {})
+    answers_map = _normalize_answers_map(data.get("answers_map"))
     q_msg_id = data.get("q_msg_id")
     question = questions[current]
     attempt_id = data.get("attempt_id")
@@ -715,6 +1714,7 @@ async def handle_answer(callback: types.CallbackQuery, state: FSMContext):
 
     # Если выбран текстовый ответ — переходим в режим ввода, редактируя то же сообщение
     if value == "text":
+        await state.update_data(active_question_id=qid, return_state=Form.answering_question)
         await state.set_state(Form.manual_text_answer)
         await callback.bot.edit_message_text(
             chat_id=callback.message.chat.id,
@@ -774,13 +1774,11 @@ async def _safe_delete(msg: types.Message):
 
 async def _save_text_answer(message: types.Message, state: FSMContext, text_answer: str, *, delete_message: bool = True):
     data = await state.get_data()
-    questions = data.get("questions") or []
-    current = data.get("current")
-    if current is None or current >= len(questions):
+    qid, question = _resolve_question(data, data.get("active_question_id"))
+    if not qid or not question:
         return
 
-    qid = questions[current]["id"]
-    answers_map = data.get("answers_map", {})
+    answers_map = _normalize_answers_map(data.get("answers_map"))
     answers_map.setdefault(qid, {"answer": None, "comment": None, "photo_path": None})["answer"] = text_answer
     await state.update_data(answers_map=answers_map)
 
@@ -791,19 +1789,24 @@ async def _save_text_answer(message: types.Message, state: FSMContext, text_answ
     if delete_message:
         await _safe_delete(message)
 
-    await state.set_state(Form.answering_question)
-    await ask_next_question(message, state)
+    return_state = data.get("return_state") or Form.answering_question
+    await state.update_data(active_question_id=None, return_state=None)
+
+    if return_state == Form.answering_block:
+        await state.set_state(Form.answering_block)
+        await _refresh_block_question(message, state, qid)
+    else:
+        await state.set_state(Form.answering_question)
+        await ask_next_question(message, state)
 
 
 async def _save_comment_text(message: types.Message, state: FSMContext, comment_text: str, *, delete_message: bool = True):
     data = await state.get_data()
-    questions = data.get("questions") or []
-    current = data.get("current")
-    if current is None or current >= len(questions):
+    qid, question = _resolve_question(data, data.get("active_question_id"))
+    if not qid or not question:
         return
 
-    qid = questions[current]["id"]
-    answers_map = data.get("answers_map", {})
+    answers_map = _normalize_answers_map(data.get("answers_map"))
     answers_map.setdefault(qid, {"answer": None, "comment": None, "photo_path": None})["comment"] = comment_text
     await state.update_data(answers_map=answers_map)
 
@@ -814,8 +1817,15 @@ async def _save_comment_text(message: types.Message, state: FSMContext, comment_
     if delete_message:
         await _safe_delete(message)
 
-    await state.set_state(Form.answering_question)
-    await ask_next_question(message, state)
+    return_state = data.get("return_state") or Form.answering_question
+    await state.update_data(active_question_id=None, return_state=None)
+
+    if return_state == Form.answering_block:
+        await state.set_state(Form.answering_block)
+        await _refresh_block_question(message, state, qid)
+    else:
+        await state.set_state(Form.answering_question)
+        await ask_next_question(message, state)
 
 
 @router.message(Form.manual_text_answer)
@@ -832,8 +1842,18 @@ async def handle_manual_text_answer(message: types.Message, state: FSMContext):
 async def handle_comment_button(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     q_msg_id = data.get("q_msg_id")
+    questions = data.get("questions") or []
+    current = data.get("current")
+    qid = None
+    if current is not None and 0 <= current < len(questions):
+        qid = questions[current]["id"]
+
     await state.set_state(Form.adding_comment)
-    await state.update_data(submode="comment")
+    await state.update_data(
+        submode="comment",
+        active_question_id=qid,
+        return_state=Form.answering_question,
+    )
 
     await callback.bot.edit_message_text(
         chat_id=callback.message.chat.id,
@@ -857,16 +1877,17 @@ async def handle_comment_text(message: types.Message, state: FSMContext):
 
 async def _attach_photo_to_current_question(message: types.Message, state: FSMContext) -> None:
     data = await state.get_data()
-    questions = data.get("questions")
-    current = data.get("current")
-    answers_map = data.get("answers_map", {})
+    answers_map = _normalize_answers_map(data.get("answers_map"))
     attempt_id = data.get("attempt_id")
 
-    if not message.photo or not questions or current is None or current >= len(questions):
+    if not message.photo:
         await message.answer("Пожалуйста, отправьте фото.")
         return
 
-    qid = questions[current]["id"]
+    qid, question = _resolve_question(data, data.get("active_question_id"))
+    if not qid or not question:
+        await message.answer("Не удалось определить вопрос для фото.")
+        return
 
     file_id = message.photo[-1].file_id
     stored_path = await _store_photo_locally(message.bot, file_id, attempt_id, qid)
@@ -880,8 +1901,15 @@ async def _attach_photo_to_current_question(message: types.Message, state: FSMCo
 
     await _safe_delete(message)
 
-    await state.set_state(Form.answering_question)
-    await ask_next_question(message, state)
+    return_state = data.get("return_state") or Form.answering_question
+    await state.update_data(active_question_id=None, return_state=None)
+
+    if return_state == Form.answering_block:
+        await state.set_state(Form.answering_block)
+        await _refresh_block_question(message, state, qid)
+    else:
+        await state.set_state(Form.answering_question)
+        await ask_next_question(message, state)
 
 
 @router.message(F.photo, Form.answering_question)
@@ -906,6 +1934,8 @@ async def handle_direct_text(message: types.Message, state: FSMContext):
 
     question = questions[current]
     qtype = (question.get("type") or "").lower().strip()
+    qid = question.get("id")
+    await state.update_data(active_question_id=qid, return_state=Form.answering_question)
 
     if qtype in {"yesno", "yes_no", "boolean", "bool", "yn", "scale", "rating"}:
         await _save_comment_text(message, state, text_value)
@@ -925,7 +1955,17 @@ async def handle_direct_text(message: types.Message, state: FSMContext):
 async def handle_photo_button(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     q_msg_id = data.get("q_msg_id")
+    questions = data.get("questions") or []
+    current = data.get("current")
+    qid = None
+    if current is not None and 0 <= current < len(questions):
+        qid = questions[current]["id"]
     await state.set_state(Form.adding_photo)
+    await state.update_data(
+        active_question_id=qid,
+        return_state=Form.answering_question,
+        submode="photo",
+    )
 
     await callback.bot.edit_message_text(
         chat_id=callback.message.chat.id,
@@ -974,8 +2014,18 @@ async def handle_text_choice(callback: types.CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "back_to_question")
 async def handle_back_to_question(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(Form.answering_question)
-    await ask_next_question(callback.message, state)
+    data = await state.get_data()
+    return_state = data.get("return_state") or Form.answering_question
+    qid = data.get("active_question_id")
+
+    await state.update_data(active_question_id=None, return_state=None)
+
+    if return_state == Form.answering_block and qid:
+        await state.set_state(Form.answering_block)
+        await _refresh_block_question(callback.message, state, qid)
+    else:
+        await state.set_state(Form.answering_question)
+        await ask_next_question(callback.message, state)
     await callback.answer()
 
 @router.callback_query(F.data == "continue_after_extra")
@@ -983,7 +2033,7 @@ async def handle_continue_after_extra(callback: types.CallbackQuery, state: FSMC
     data = await state.get_data()
     questions = data["questions"]
     current = data["current"]
-    answers_map = data.get("answers_map", {})
+    answers_map = _normalize_answers_map(data.get("answers_map"))
     q_msg_id = data.get("q_msg_id")
 
     if current >= len(questions):
@@ -1074,7 +2124,7 @@ async def handle_hint(callback: types.CallbackQuery):
 async def handle_show_details(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     questions = data["questions"]
-    answers_map = data.get("answers_map", {})
+    answers_map = _normalize_answers_map(data.get("answers_map"))
 
     lines = ["🔍 <b>Подробные ответы:</b>"]
     for q in questions:
@@ -1103,7 +2153,7 @@ async def handle_show_answers_here(callback: types.CallbackQuery, state: FSMCont
     data = await state.get_data()
     msg_id = data.get("next_actions_msg_id")
     questions = data.get("questions", [])
-    answers_map = data.get("answers_map", {})
+    answers_map = _normalize_answers_map(data.get("answers_map"))
 
     attempt_data = data.get("attempt_data")
     text = _answers_summary_text(questions, answers_map, attempt_data=attempt_data)

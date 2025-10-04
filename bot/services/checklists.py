@@ -36,5 +36,17 @@ class ChecklistsService:
     def save_photo(self, answer_id: int, question_id: int, photo_path: Optional[str]) -> None:
         self.attempts.save_photo_path(answer_id=answer_id, question_id=question_id, photo_path=photo_path)
 
-    def finish(self, answer_id: int) -> None:
-        self.attempts.finish_attempt(answer_id)
+    def finish(self, answer_id: int) -> Optional[int]:
+        return self.attempts.finish_attempt(answer_id)
+
+    def discard(self, answer_id: int) -> None:
+        self.attempts.discard_attempt(answer_id)
+
+    def find_draft_attempt(self, user_id: int, checklist_id: int) -> Optional[int]:
+        return self.attempts.get_draft_id(user_id=user_id, checklist_id=checklist_id)
+
+    def get_draft_department(self, draft_id: int) -> Optional[str]:
+        return self.attempts.get_draft_department(draft_id)
+
+    def set_draft_department(self, draft_id: int, department: Optional[str]) -> None:
+        self.attempts.set_draft_department(draft_id, department)

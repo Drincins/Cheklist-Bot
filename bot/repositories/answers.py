@@ -28,12 +28,16 @@ class AnswersRepo:
                     ChecklistAnswer.submitted_at.label("submitted_at"),
                 )
                 .join(Checklist, Checklist.id == ChecklistAnswer.checklist_id)
-                .filter(ChecklistAnswer.user_id == user_id)
+                .filter(
+                    ChecklistAnswer.user_id == user_id,
+                    ChecklistAnswer.submitted_at.isnot(None),
+                )
                 .order_by(ChecklistAnswer.submitted_at.desc())
             )
 
             total = db.query(func.count(ChecklistAnswer.id)).filter(
-                ChecklistAnswer.user_id == user_id
+                ChecklistAnswer.user_id == user_id,
+                ChecklistAnswer.submitted_at.isnot(None),
             ).scalar() or 0
 
             rows = base.offset(offset).limit(limit).all()
@@ -41,7 +45,7 @@ class AnswersRepo:
                 {
                     "answer_id": r.answer_id,
                     "checklist_name": r.checklist_name,
-                    "submitted_at": to_moscow(r.submitted_at),
+                    "submitted_at": to_moscow(r.submitted_at) if r.submitted_at else None,
                 }
                 for r in rows
             ]

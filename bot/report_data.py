@@ -4,12 +4,19 @@ import json
 import logging
 import os
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional, List, Any, Dict
 
+from sqlalchemy import func
+
 from checklist.db.db import SessionLocal
 from checklist.db.models.checklist import (
-    Checklist, ChecklistAnswer, ChecklistQuestion, ChecklistQuestionAnswer
+    Checklist,
+    ChecklistAnswer,
+    ChecklistQuestion,
+    ChecklistQuestionAnswer,
+    ChecklistSection,
 )
 from checklist.db.models.user import User
 from checklist.db.models.company import Company
@@ -30,6 +37,17 @@ class AnswerRow:
     weight: Optional[float] = None   # максимальный вес вопроса
     photo_path: Optional[str] = None
     photo_label: Optional[str] = None
+    section_id: Optional[int] = None
+    section_title: Optional[str] = None
+
+
+@dataclass
+class SectionResult:
+    title: str
+    answers: List[AnswerRow]
+    total_score: Optional[float] = None
+    total_max: Optional[float] = None
+    percent: Optional[float] = None
 
 
 @dataclass
@@ -45,6 +63,7 @@ class AttemptData:
     total_max: Optional[float] = None
     percent: Optional[float] = None
     is_scored: bool = False
+    sections: Optional[List[SectionResult]] = None
 
 
 # ---------------- formatting helpers ----------------
@@ -218,7 +237,11 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
                 ChecklistQuestion.type,
                 ChecklistQuestion.order,
                 ChecklistQuestion.meta,
+                ChecklistQuestion.section_id,
+                ChecklistSection.name.label("section_title"),
+                ChecklistSection.order.label("section_order"),
             )
+            .outerjoin(ChecklistSection, ChecklistSection.id == ChecklistQuestion.section_id)
             .filter(ChecklistQuestion.checklist_id == attempt.checklist_id)
             .subquery()
         )
@@ -231,6 +254,9 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
                 q_sub.c.type.label("qtype"),
                 q_sub.c.order.label("qorder"),
                 q_sub.c.meta.label("qmeta"),
+                q_sub.c.section_id.label("section_id"),
+                q_sub.c.section_title.label("section_title"),
+                q_sub.c.section_order.label("section_order"),
                 ChecklistQuestionAnswer.response_value,
                 ChecklistQuestionAnswer.comment,
                 ChecklistQuestionAnswer.photo_path,
@@ -240,7 +266,11 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
                 (ChecklistQuestionAnswer.question_id == q_sub.c.id)
                 & (ChecklistQuestionAnswer.answer_id == attempt_id)
             )
-            .order_by(q_sub.c.order.asc())
+            .order_by(
+                func.coalesce(q_sub.c.section_order, 10 ** 6).asc(),
+                q_sub.c.order.asc(),
+                q_sub.c.id.asc(),
+            )
             .all()
         )
 
@@ -258,6 +288,7 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
         total_score_acc = 0.0
         total_max_acc = 0.0
         has_scored_questions = False
+        sections_map: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         for idx, row in enumerate(q_and_a, start=1):
             answer_raw = row.response_value
             answer_str = "" if answer_raw is None else str(answer_raw)
@@ -315,7 +346,18 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
                     # вопрос с весом, но без подсчитанного балла — считаем 0
                     total_score_acc += 0.0
 
-            rows.append(AnswerRow(
+            section_title = (row.section_title or "Без раздела").strip() or "Без раздела"
+            section_id = row.section_id
+            section_key = section_id if section_id is not None else f"__none__:{section_title}"
+
+            if section_key not in sections_map:
+                sections_map[section_key] = {
+                    "result": SectionResult(title=section_title, answers=[]),
+                    "score_acc": 0.0,
+                    "max_acc": 0.0,
+                }
+
+            answer_row = AnswerRow(
                 number=idx,
                 question=row.qtext,
                 qtype=row.qtype,
@@ -325,7 +367,30 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
                 weight=weight,
                 photo_path=row.photo_path,
                 photo_label=f"Вопрос №{idx}",
-            ))
+                section_id=section_id,
+                section_title=section_title,
+            )
+            rows.append(answer_row)
+
+            section_entry = sections_map[section_key]
+            section_entry["result"].answers.append(answer_row)
+            if weight is not None:
+                section_entry["max_acc"] += weight
+                if score is not None:
+                    section_entry["score_acc"] += max(0.0, score)
+                else:
+                    section_entry["score_acc"] += 0.0
+
+        section_results: List[SectionResult] = []
+        for entry in sections_map.values():
+            result = entry["result"]
+            max_acc = entry["max_acc"]
+            score_acc = entry["score_acc"]
+            if is_scored and max_acc > 0:
+                result.total_max = round(max_acc, 2)
+                result.total_score = round(score_acc, 2)
+                result.percent = round((score_acc / max_acc) * 100, 2) if max_acc else None
+            section_results.append(result)
 
         total_score = None
         total_max = None
@@ -347,4 +412,5 @@ def get_attempt_data(attempt_id: int) -> AttemptData:
             total_max=total_max,
             percent=percent,
             is_scored=is_scored,
+            sections=section_results or None,
         )

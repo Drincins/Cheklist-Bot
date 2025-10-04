@@ -4,7 +4,8 @@ import os
 import tempfile
 import datetime as dt
 import math
-from typing import Optional
+from typing import Optional, List
+from xml.sax.saxutils import escape
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -13,6 +14,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
 )
+from reportlab.platypus.flowables import Flowable
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
@@ -20,11 +22,11 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 import openpyxl
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.drawing.image import Image as XLImage
 from PIL import Image as PILImage
 
-from .report_data import AnswerRow, AttemptData
+from .report_data import AnswerRow, AttemptData, SectionResult
 from .utils.timezone import to_moscow, format_moscow
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,25 @@ def export_attempt_to_pdf(filename: str, data: AttemptData):
         alignment=1,
         spaceBefore=12,
         spaceAfter=18,
+    )
+    section_title_style = ParagraphStyle(
+        name="SectionTitle",
+        parent=styles["Heading3"],
+        fontName=font_name or styles["Heading3"].fontName,
+        fontSize=14,
+        leading=18,
+        textColor=colors.HexColor("#1F3B4D"),
+        spaceBefore=12,
+        spaceAfter=6,
+    )
+    section_score_style = ParagraphStyle(
+        name="SectionScore",
+        parent=normal_style,
+        fontSize=10,
+        leading=12,
+        textColor=colors.HexColor("#4A4A4A"),
+        spaceBefore=4,
+        spaceAfter=6,
     )
 
     doc = SimpleDocTemplate(filename, pagesize=A4, leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
@@ -249,30 +270,13 @@ def export_attempt_to_pdf(filename: str, data: AttemptData):
     scores_plain = [headers[4]] + [_fmt_score(row) for row in data.answers]
     numbers_plain = [headers[0]] + [str(row.number) for row in data.answers]
 
-    table_data = [[
-        PH(headers[0]),
-        PH(headers[1]),
-        PH(headers[2]),
-        PH(headers[3]),
-        PH(headers[4]),
-        PH(headers[5]),
-    ]]
     photo_draw_widths: list[float] = [0.0]
     for row in data.answers:
-        photo_flowable = _image_cell(row.photo_path) if row.photo_path else ""
-        if isinstance(photo_flowable, RLImage):
-            photo_draw_widths.append(photo_flowable.drawWidth)
+        tmp_photo = _image_cell(row.photo_path) if row.photo_path else ""
+        if isinstance(tmp_photo, RLImage):
+            photo_draw_widths.append(tmp_photo.drawWidth)
         else:
             photo_draw_widths.append(0.0)
-
-        table_data.append([
-            row.number,
-            P(row.question),
-            P(_norm_answer_for_row(row)),
-            P(row.comment or ""),
-            _fmt_score(row),
-            photo_flowable,
-        ])
 
     from reportlab.pdfbase.pdfmetrics import stringWidth
 
@@ -335,13 +339,7 @@ def export_attempt_to_pdf(filename: str, data: AttemptData):
         factor = doc.width / total_width
         col_widths = [w * factor for w in col_widths]
 
-    table = Table(
-        table_data,
-        colWidths=col_widths,
-        repeatRows=1,
-        hAlign='LEFT'
-    )
-    table.setStyle(TableStyle([
+    table_style = TableStyle([
         ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1F3B4D")),
         ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
         ('ALIGN', (0,0), (-1,0), 'CENTER'),
@@ -362,8 +360,67 @@ def export_attempt_to_pdf(filename: str, data: AttemptData):
         ('ALIGN', (0,1), (0,-1), 'CENTER'),
         ('ALIGN', (4,1), (4,-1), 'CENTER'),
         ('ALIGN', (5,1), (5,-1), 'CENTER'),
-    ]))
-    elements.append(table)
+    ])
+
+    sections_to_render: List[SectionResult]
+    if data.sections:
+        sections_to_render = [sec for sec in data.sections if sec.answers]
+    else:
+        sections_to_render = []
+
+    use_sections = len(sections_to_render) > 1
+    if not sections_to_render:
+        sections_to_render = [SectionResult(title=None, answers=data.answers)]
+
+    for idx, section in enumerate(sections_to_render, start=1):
+        answers_in_section = section.answers
+        if not answers_in_section:
+            continue
+
+        if use_sections:
+            title_text = section.title or "Без раздела"
+            elements.append(Paragraph(
+                f"📂 Блок {idx}: <b>{escape(title_text)}</b>",
+                section_title_style,
+            ))
+
+        section_table_rows = [[
+            PH(headers[0]),
+            PH(headers[1]),
+            PH(headers[2]),
+            PH(headers[3]),
+            PH(headers[4]),
+            PH(headers[5]),
+        ]]
+
+        for row in answers_in_section:
+            section_table_rows.append([
+                row.number,
+                P(row.question),
+                P(_norm_answer_for_row(row)),
+                P(row.comment or ""),
+                _fmt_score(row),
+                _image_cell(row.photo_path) if row.photo_path else "",
+            ])
+
+        section_table = Table(
+            section_table_rows,
+            colWidths=col_widths,
+            repeatRows=1,
+            hAlign='LEFT'
+        )
+        section_table.setStyle(table_style)
+        elements.append(section_table)
+
+        if use_sections and data.is_scored and section.total_score is not None and section.total_max is not None:
+            percent_text = f" ({_fmt_number(section.percent)}%)" if section.percent is not None else ""
+            section_summary = (
+                f"Результат блока: {_fmt_number(section.total_score)} из "
+                f"{_fmt_number(section.total_max)} баллов{percent_text}"
+            )
+            elements.append(Paragraph(section_summary, section_score_style))
+
+        elements.append(Spacer(1, 12))
 
     if data.is_scored and data.total_score is not None and data.total_max is not None:
         percent_text = f" ({_fmt_number(data.percent)}%)" if data.percent is not None else ""
@@ -478,32 +535,79 @@ def export_attempt_to_excel(filename: str, data: AttemptData):
         base_lines = max(q_lines, a_lines, c_lines)
         return 15 * base_lines + 6
 
+    sections_to_render: List[SectionResult]
+    if data.sections:
+        sections_to_render = [sec for sec in data.sections if sec.answers]
+    else:
+        sections_to_render = []
+
+    use_sections = len(sections_to_render) > 1
+    if not sections_to_render:
+        sections_to_render = [SectionResult(title=None, answers=data.answers)]
+
     tmp_thumbs: list[str] = []
     photo_refs: list[tuple[str, str]] = []
     try:
-        for i, row in enumerate(data.answers, start=2):
-            ws.cell(row=i, column=1, value=row.number).alignment = Alignment(horizontal="center", vertical="top")
-            ws.cell(row=i, column=2, value=row.question).alignment = Alignment(wrap_text=True, vertical="top")
-            norm_answer = _norm_answer_for_row(row)
-            ws.cell(row=i, column=3, value=norm_answer).alignment = Alignment(wrap_text=True, vertical="top")
-            ws.cell(row=i, column=4, value=row.comment or "").alignment = Alignment(wrap_text=True, vertical="top")
-            ws.cell(row=i, column=5, value=_fmt_score(row)).alignment = Alignment(horizontal="center", vertical="top")
+        current_row = 2
 
-            approx_height = _estimate_row_height(row.question or "", norm_answer, row.comment or "")
-            ws.row_dimensions[i].height = max(ws.row_dimensions[i].height or 0, approx_height)
+        for sec_idx, section in enumerate(sections_to_render, start=1):
+            answers_in_section = section.answers
+            if not answers_in_section:
+                continue
 
+            if use_sections:
+                if current_row > 2:
+                    current_row += 1  # пустая строка между блоками
+                block_title = section.title or "Без раздела"
+                ws.cell(row=current_row, column=1, value=f"Блок {sec_idx}: {block_title}")
+                ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=6)
+                ws.cell(row=current_row, column=1).font = Font(bold=True, size=12)
+                ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="left", vertical="center")
+                ws.cell(row=current_row, column=1).fill = PatternFill(start_color="F0F4FF", end_color="F0F4FF", fill_type="solid")
+                ws.row_dimensions[current_row].height = 22
+                current_row += 1
 
-            # Фото → колонка F
-            if row.photo_path and os.path.exists(row.photo_path):
-                thumb_path, w_px, h_px = _make_thumb(row.photo_path)
-                if thumb_path:
-                    tmp_thumbs.append(thumb_path)
-                    img = XLImage(thumb_path)
-                    ws.add_image(img, f"F{i}")
-                    ws.row_dimensions[i].height = max(ws.row_dimensions[i].height or 0, int((h_px + 10) * excel_px_to_pts))
-                photo_refs.append((row.photo_label or f"Вопрос №{row.number}", row.photo_path))
-            else:
-                ws.cell(row=i, column=6, value="").alignment = Alignment(vertical="top")
+            for row in answers_in_section:
+                row_idx = current_row
+                norm_answer = _norm_answer_for_row(row)
+
+                ws.cell(row=row_idx, column=1, value=row.number).alignment = Alignment(horizontal="center", vertical="top")
+                ws.cell(row=row_idx, column=2, value=row.question).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.cell(row=row_idx, column=3, value=norm_answer).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.cell(row=row_idx, column=4, value=row.comment or "").alignment = Alignment(wrap_text=True, vertical="top")
+                ws.cell(row=row_idx, column=5, value=_fmt_score(row)).alignment = Alignment(horizontal="center", vertical="top")
+
+                approx_height = _estimate_row_height(row.question or "", norm_answer, row.comment or "")
+                ws.row_dimensions[row_idx].height = max(ws.row_dimensions[row_idx].height or 0, approx_height)
+
+                if row.photo_path and os.path.exists(row.photo_path):
+                    thumb_path, w_px, h_px = _make_thumb(row.photo_path)
+                    if thumb_path:
+                        tmp_thumbs.append(thumb_path)
+                        img = XLImage(thumb_path)
+                        ws.add_image(img, f"F{row_idx}")
+                        ws.row_dimensions[row_idx].height = max(
+                            ws.row_dimensions[row_idx].height or 0,
+                            int((h_px + 10) * excel_px_to_pts),
+                        )
+                    photo_refs.append((row.photo_label or f"Вопрос №{row.number}", row.photo_path))
+                else:
+                    ws.cell(row=row_idx, column=6, value="").alignment = Alignment(vertical="top")
+
+                current_row += 1
+
+            if use_sections and data.is_scored and section.total_score is not None and section.total_max is not None:
+                summary_text = (
+                    f"Результат блока: {_fmt_number(section.total_score)} из "
+                    f"{_fmt_number(section.total_max)} баллов"
+                )
+                if section.percent is not None:
+                    summary_text += f" ({_fmt_number(section.percent)}%)"
+                ws.cell(row=current_row, column=1, value=summary_text)
+                ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=6)
+                ws.cell(row=current_row, column=1).font = Font(size=10, italic=True)
+                ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="left", vertical="center")
+                current_row += 1
     finally:
         if photo_refs:
             ws.append([])
@@ -540,6 +644,27 @@ def export_attempt_to_excel(filename: str, data: AttemptData):
         else:
             total_score = sum([r.score for r in data.answers if isinstance(r.score, (int, float))])
             ws2.append(["Набранные баллы", _fmt_number(total_score)])
+
+        if data.is_scored and use_sections:
+            block_rows = [
+                (idx, sec)
+                for idx, sec in enumerate(sections_to_render, start=1)
+                if sec.total_score is not None and sec.total_max is not None
+            ]
+            if block_rows:
+                ws2.append([])
+                ws2.append(["Блок", "Результат"])
+                block_header_row = ws2.max_row
+                ws2[f"A{block_header_row}"].font = header_font
+                ws2[f"B{block_header_row}"].font = header_font
+                for idx, sec in block_rows:
+                    res_text = (
+                        f"{_fmt_number(sec.total_score)} из "
+                        f"{_fmt_number(sec.total_max)} баллов"
+                    )
+                    if sec.percent is not None:
+                        res_text += f" ({_fmt_number(sec.percent)}%)"
+                    ws2.append([f"Блок {idx}: {sec.title or 'Без раздела'}", res_text])
         _auto_fit_columns(ws2)
 
         wb.save(filename)
