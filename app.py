@@ -32,50 +32,11 @@ def _load_ui_settings(path: str = "ui_settings.csv") -> dict:
 
 
 _ui = _load_ui_settings()
-_primary = _ui.get("primaryColor", "#D87E24")
-_bg = _ui.get("backgroundColor", "#1E1E1E")
-_sb_bg = _ui.get("secondaryBackgroundColor", "#2C2C2C")
-_txt = _ui.get("textColor", "#FFFFFF")
-_font_url = _ui.get(
-    "font_url",
-    "https://fonts.googleapis.com/css2?family=Comfortaa:wght@400;600&display=swap",
-)
-_font = _ui.get("font_family", "Comfortaa")
-_font_size = int(_ui.get("font_size_px", "14") or 14)
 _wide = _ui.get("wide_mode", "true").lower() in ("1", "true", "yes", "y")
 
 # Page config (wide/centered)
 st.set_page_config(layout="wide" if _wide else "centered")
 
-# Глобальные стили: шрифт, цвета, фон сайдбара, размер шрифта, кнопки
-st.markdown(
-    f"""
-<style>
-@import url('{_font_url}');
-
-html, body, .stApp, [class*="css"]
-  font-family: '{_font}', sans-serif !important;
-  font-size: {_font_size}px !important;
-  color: {_txt} !important;
-  background: {_bg} !important;
-}}
-section[data-testid="stSidebar"] {{
-  background-color: {_sb_bg} !important;
-}}
-/* Primary-кнопки */
-div.stButton > button, button[kind="primary"] {{
-  background-color: {_primary} !important;
-  color: #000 !important;
-  border: 0 !important;
-}}
-/* Заголовки — немного жирнее */
-h1, h2, h3, h4, h5, h6 {{
-  font-weight: 600 !important;
-}}
-</style>
-""",
-    unsafe_allow_html=True,
-)
 
 
 # =========================
@@ -84,10 +45,14 @@ h1, h2, h3, h4, h5, h6 {{
 load_dotenv()
 SA_LOGIN = os.getenv("SUPERADMIN_LOGIN")
 SA_PASS = os.getenv("SUPERADMIN_PASSWORD")
+COOKIE_PASSWORD = os.getenv("COOKIE_PASSWORD")
+if not COOKIE_PASSWORD:
+    st.error("Не задан COOKIE_PASSWORD в окружении")
+    st.stop()
 init_db()
 
 # ——— Настройка cookies
-cookies = EncryptedCookieManager(prefix="checklist_", password="SECRET_COOKIE_PASSWORD_2024")
+cookies = EncryptedCookieManager(prefix="checklist_", password=COOKIE_PASSWORD)
 if not cookies.ready():
     st.stop()
 
@@ -197,4 +162,4 @@ else:
     if st.session_state.is_superadmin:
         main_superadmin()
     else:
-        company_admin_dashboard(st.session_state.admin_company_id)
+        company_admin_dashboard(st.session_state.admin_company_id, cookies=cookies)

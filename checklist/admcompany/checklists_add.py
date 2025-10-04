@@ -1,26 +1,23 @@
+# -*- coding: utf-8 -*-
 # checklist/admcompany/checklists_add.py
+
+"""
+Чистый мастер добавления нового чек-листа (без редактирования существующих).
+
+Шаг 1: название, тип (оценочный/нет), должности.
+Шаг 2: последовательное создание разделов и добавление вопросов в активный раздел;
+       затем кнопка «Новый раздел» и вопросы к нему.
+"""
+
 import streamlit as st
-from typing import Optional
-from checklist.db.db import SessionLocal
-from checklist.db.models import Checklist, ChecklistQuestion, Position
+from typing import Optional, Dict, List
 from sqlalchemy.exc import IntegrityError
+
+from checklist.db.db import SessionLocal
+from checklist.db.models import Checklist, ChecklistQuestion, ChecklistSection, Position
 
 
 def checklists_add_tab(company_id: int, embedded: bool = False, dialog_state_key: Optional[str] = None):
-    """
-    Мастер добавления чек-листа в 2 шага:
-      1) Основные настройки (название, тип, должности)
-      2) Добавление вопросов и сохранение
-
-    Что важно:
-    - Без кастомного CSS.
-    - Удаление вопросов — мгновенная перерисовка (через nonce).
-    - Поля формы «Добавить вопрос» очищаются сразу (clear_on_submit=True).
-    - Если передан dialog_state_key (модалка), то:
-        * По «Закрыть» — закрываем модалку и делаем st.rerun().
-        * После успешного сохранения — закрываем модалку и st.rerun()
-          (вкладка редактирования сразу увидит новый чек-лист).
-    """
     db = SessionLocal()
     try:
         if not embedded:
@@ -33,252 +30,244 @@ def checklists_add_tab(company_id: int, embedded: bool = False, dialog_state_key
             ss.cl_add_form = {
                 "name": "",
                 "is_scored": False,
-                "questions": [],   # [{text,type,weight,require_photo,require_comment}, ...]
-                "positions": [],   # [position_id, ...]
+                "positions": [],  # [position_id]
+                # sections: list of {title, description, is_required, questions:[{...}]}
+                "sections": [],
             }
-        # nonce — используем только для мгновенной перерисовки списка вопросов при удалении
-        if "cl_add_nonce" not in ss:
-            ss.cl_add_nonce = 0
+        if "active_section_idx" not in ss:
+            ss.active_section_idx = 0
 
-        # Кнопка «Закрыть» в модалке (если открыты внутри dialog)
+        def _ensure_first_section():
+            if not ss.cl_add_form["sections"]:
+                ss.cl_add_form["sections"].append({
+                    "title": "Раздел 1",
+                    "description": "",
+                    "is_required": False,
+                    "questions": [],
+                })
+                ss.active_section_idx = 0
+
+        # Встроенный режим: кнопка закрыть
         if embedded:
-            if st.button("✖ Закрыть", key="cl_add_close"):
+            if st.button("Закрыть", key="cl_add_close"):
                 if dialog_state_key:
                     ss[dialog_state_key] = False
                 st.rerun()
 
-        # =========================================================
-        # ШАГ 1: Основные настройки чек-листа
-        # =========================================================
+        # =============================================
+        # Шаг 1 — основные поля чек-листа
+        # =============================================
         if ss.cl_add_step == 1:
             with st.form("create_checklist_form", clear_on_submit=False):
-                name = st.text_input(
-                    "Название чек-листа",
-                    value=ss.cl_add_form["name"],
-                    key="cl_add_name_input",
-                )
-                is_scored = st.checkbox(
-                    "Оцениваемый чек-лист?",
-                    value=ss.cl_add_form["is_scored"],
-                    key="cl_add_is_scored",
-                )
+                name = st.text_input("Название чек-листа", value=ss.cl_add_form.get("name", ""))
+                is_scored = st.checkbox("Оценочный чек-лист?", value=ss.cl_add_form.get("is_scored", False))
 
-                # Должности компании
                 all_positions = (
                     db.query(Position)
                     .filter_by(company_id=company_id)
                     .order_by(Position.name.asc())
                     .all()
                 )
-                selected_pos_ids = ss.cl_add_form.get("positions", [])
-                pos_options = {}
-                default_names = []
-                if all_positions:
-                    pos_options = {p.name: p.id for p in all_positions}
-                    default_names = [p.name for p in all_positions if p.id in selected_pos_ids]
-                    selected_pos_names = st.multiselect(
-                        "Для должностей (множественный выбор)",
-                        options=list(pos_options.keys()),
-                        default=default_names,
-                        key="add_step1_pos_multiselect",
-                    )
-                    selected_pos_ids = [pos_options[name] for name in selected_pos_names]
-                else:
-                    st.info("Сначала добавьте должности в компании, чтобы назначить доступ к чек-листу.")
-
-                submit = st.form_submit_button("Создать и перейти к вопросам ➡️")
+                pos_map: Dict[str, int] = {p.name: p.id for p in all_positions}
+                default_names = [p.name for p in all_positions if p.id in ss.cl_add_form.get("positions", [])]
+                chosen_pos_names = st.multiselect(
+                    "Должности (множественный выбор)",
+                    options=list(pos_map.keys()),
+                    default=default_names,
+                    key="add_step1_pos_multiselect",
+                )
+                submit = st.form_submit_button("Далее")
 
             if submit:
-                if not name.strip():
+                nm = (name or "").strip()
+                if not nm:
                     st.error("Введите название чек-листа")
                 else:
-                    ss.cl_add_form["name"] = name.strip()
+                    ss.cl_add_form["name"] = nm
                     ss.cl_add_form["is_scored"] = bool(is_scored)
-                    ss.cl_add_form["positions"] = selected_pos_ids
+                    ss.cl_add_form["positions"] = [pos_map[n] for n in chosen_pos_names]
                     ss.cl_add_step = 2
-                    # без st.rerun()
+                    st.rerun()
 
-        # =========================================================
-        # ШАГ 2: Добавление вопросов и сохранение
-        # =========================================================
+        # =============================================
+        # Шаг 2 — последовательные разделы и вопросы
+        # =============================================
         if ss.cl_add_step == 2:
             st.markdown(f"**Чек-лист:** {ss.cl_add_form['name']}")
-            is_scored = ss.cl_add_form["is_scored"]
-            st.write("Тип: " + ("Оцениваемый" if is_scored else "Без оценки"))
+            st.caption("Тип: " + ("Оценочный" if ss.cl_add_form.get("is_scored") else "Без оценки"))
 
-            # Показ выбранных должностей
+            # Выбранные должности (если есть)
             if ss.cl_add_form.get("positions"):
                 _all = db.query(Position).filter_by(company_id=company_id).all()
                 by_id = {p.id: p.name for p in _all}
-                chosen = [by_id.get(pid, f"id={pid}") for pid in ss.cl_add_form["positions"]]
-                st.caption("Назначено для должностей: " + ", ".join(chosen))
+                st.caption("Назначено для должностей: " + ", ".join(by_id.get(pid, str(pid)) for pid in ss.cl_add_form["positions"]))
 
-            st.markdown("### Добавьте вопросы")
+            _ensure_first_section()
+            sections = ss.cl_add_form["sections"]
+            idx = ss.active_section_idx
+            idx = max(0, min(idx, len(sections) - 1))
+            ss.active_section_idx = idx
+            sec = sections[idx]
 
-            # Типы ответа
-            answer_types = (
-                ["Да/Нет/Пропустить", "Шкала (1-10)"]
-                if is_scored
-                else ["Короткий текст", "Длинный текст", "Да/Нет/Пропустить", "Шкала (1-10)"]
-            )
+            st.markdown("---")
+            st.markdown(f"### Раздел {idx + 1}")
+            sec_title = st.text_input("Название раздела", value=sec.get("title", ""), key=f"sec_title_{idx}")
+            sec_desc = st.text_area("Описание (опционально)", value=sec.get("description", ""), key=f"sec_desc_{idx}")
+            sec_req = st.checkbox("Обязательный раздел", value=bool(sec.get("is_required")), key=f"sec_req_{idx}")
+            if st.button("Сохранить раздел", key=f"sec_save_{idx}"):
+                sec["title"] = (sec_title or "").strip() or f"Раздел {idx + 1}"
+                sec["description"] = (sec_desc or "").strip()
+                sec["is_required"] = bool(sec_req)
+                st.success("Раздел сохранен")
+                st.rerun()
 
-            # --- Форма добавления вопроса ---
-            # ВАЖНО: clear_on_submit=True — поля очищаются сразу после успешного сабмита
-            with st.form("add_question_form", clear_on_submit=True):
-                q_text = st.text_input("1) Вопрос", key="add_q_text", value="")
-                q_type = st.selectbox(
-                    "2) Тип ответа",
-                    answer_types,
-                    index=0 if answer_types else None,
-                    key="add_q_type",
-                )
+            # Список вопросов текущего раздела
+            st.markdown("#### Вопросы раздела")
+            qs: List[Dict] = sec.setdefault("questions", [])
+            if qs:
+                for n, q in enumerate(qs, 1):
+                    suffix = ""
+                    if ss.cl_add_form.get("is_scored") and q.get("weight") is not None:
+                        suffix = f" (вес {q['weight']})"
+                    st.markdown(f"{n}. {q['text']} - {q['type']}{suffix}")
+                    if st.button("Удалить", key=f"q_del_{idx}_{n}"):
+                        qs.pop(n - 1)
+                        st.rerun()
+            else:
+                st.info("Пока нет вопросов. Добавьте первый вопрос.")
 
+            # Форма добавления вопроса в текущий раздел
+            st.markdown("**Добавить вопрос**")
+            answer_types = ["Короткий текст", "Длинный текст", "Да/Нет", "Шкала (1-10)"]
+            if ss.cl_add_form.get("is_scored"):
+                answer_types = ["Да/Нет", "Шкала (1-10)"]
+            with st.form(f"add_question_form_{idx}", clear_on_submit=True):
+                q_text = st.text_input("Текст вопроса", key=f"q_text_{idx}")
+                q_type = st.selectbox("Тип ответа", options=answer_types, key=f"q_type_{idx}")
                 q_weight = None
-                if is_scored and q_type in ["Да/Нет/Пропустить", "Шкала (1-10)"]:
-                    q_weight = st.number_input(
-                        "3) Вес вопроса (1–10)",
-                        min_value=1, max_value=10,
-                        value=1,
-                        key="add_q_weight",
-                    )
-
-                req_photo = st.checkbox(
-                    "4) Обязательно приложить фотографию",
-                    value=False,
-                    key="add_req_photo",
-                )
-                req_comment = st.checkbox(
-                    "5) Обязательно дополнить ответ комментарием",
-                    value=False,
-                    key="add_req_comment",
-                )
-
-                q_submit = st.form_submit_button("➕ Добавить вопрос")
-
-            # Добавление вопроса
+                if ss.cl_add_form.get("is_scored") and q_type in ("Да/Нет", "Шкала (1-10)"):
+                    q_weight = st.number_input("Вес вопроса (1-10)", min_value=1, max_value=10, value=1, key=f"q_weight_{idx}")
+                req_photo = st.checkbox("Требовать фото", value=False, key=f"q_req_photo_{idx}")
+                req_comment = st.checkbox("Требовать комментарий", value=False, key=f"q_req_comment_{idx}")
+                q_required = st.checkbox("Обязательный вопрос?", value=True, key=f"q_required_{idx}")
+                q_submit = st.form_submit_button("Добавить вопрос")
             if q_submit:
-                txt = (st.session_state.get("add_q_text") or "").strip()
+                txt = (q_text or "").strip()
                 if not txt:
                     st.warning("Введите текст вопроса")
                 else:
-                    ss.cl_add_form["questions"].append(
-                        {
-                            "text": txt,
-                            "type": st.session_state.get("add_q_type"),
-                            "weight": (int(st.session_state.get("add_q_weight", 1))
-                                       if (is_scored and st.session_state.get("add_q_type") in ["Да/Нет/Пропустить", "Шкала (1-10)"])
-                                       else None),
-                            "require_photo": bool(st.session_state.get("add_req_photo")),
-                            "require_comment": bool(st.session_state.get("add_req_comment")),
-                        }
-                    )
+                    qs.append({
+                        "text": txt,
+                        "type": q_type,
+                        "weight": int(q_weight) if (q_weight is not None) else None,
+                        "require_photo": bool(req_photo),
+                        "require_comment": bool(req_comment),
+                        "required": bool(q_required),
+                    })
                     st.success("Вопрос добавлен")
-                    # Поля очищены самим формом (clear_on_submit=True)
+                    st.rerun()
 
-            # Список вопросов + удаление (мгновенная перерисовка за счёт nonce)
-            if ss.cl_add_form["questions"]:
-                st.markdown("#### Вопросы чек-листа:")
-                nonce = ss.cl_add_nonce  # для уникальности ключей кнопок
-                for idx, q in enumerate(ss.cl_add_form["questions"]):
-                    num = idx + 1
-                    extras = []
-                    if q.get("weight"):
-                        extras.append(f"вес {q['weight']}")
-                    if q.get("require_photo"):
-                        extras.append("фото обязательно")
-                    if q.get("require_comment"):
-                        extras.append("комментарий обязателен")
-                    suffix = f" ({', '.join(extras)})" if extras else ""
-                    c_txt, c_del = st.columns([0.95, 0.05])
-                    with c_txt:
-                        st.markdown(f"{num}. **{q['text']}** — {q['type']}{suffix}")
-                    with c_del:
-                        if st.button("✖", key=f"del_draft_q_{nonce}_{num}", help="Удалить вопрос"):
-                            del ss.cl_add_form["questions"][idx]
-                            ss.cl_add_nonce += 1  # форс обновление списка
-                            st.toast("Вопрос удалён")
+            st.markdown("---")
+            # Добавить новый раздел (становится активным)
+            if st.button("Новый раздел", key=f"sec_new_{idx}"):
+                sections.append({
+                    "title": f"Раздел {len(sections) + 1}",
+                    "description": "",
+                    "is_required": False,
+                    "questions": [],
+                })
+                ss.active_section_idx = len(sections) - 1
+                st.rerun()
 
-            # Кнопки навигации / сохранения
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("⬅️ Назад", key=f"add_back_{ss.cl_add_nonce}"):
-                    ss.cl_add_step = 1  # без rerun
-            with c2:
-                if st.button("💾 Сохранить чек-лист", key=f"add_save_checklist_{ss.cl_add_nonce}"):
-                    if not ss.cl_add_form["questions"]:
-                        st.error("Добавьте хотя бы один вопрос")
-                    else:
-                        try:
-                            # Проверка на дубликат имени в рамках компании
-                            existing = (
-                                db.query(Checklist)
-                                .filter_by(name=ss.cl_add_form["name"], company_id=company_id)
-                                .first()
+            # Кнопки навигации и сохранения
+            c_back, c_save = st.columns([1, 2])
+            with c_back:
+                if st.button("Назад", key="add_back"):
+                    ss.cl_add_step = 1
+                    st.rerun()
+            with c_save:
+                if st.button("Сохранить чек-лист", key="add_save"):
+                    try:
+                        # Проверка дубля названия в пределах компании
+                        existing = (
+                            db.query(Checklist)
+                            .filter_by(name=ss.cl_add_form["name"], company_id=company_id)
+                            .first()
+                        )
+                        if existing:
+                            st.warning("Чек-лист с таким названием уже существует.")
+                            return
+
+                        # Должности
+                        pos_ids = ss.cl_add_form.get("positions", [])
+                        assigned_positions = (
+                            db.query(Position).filter(Position.id.in_(pos_ids)).all()
+                            if pos_ids else []
+                        )
+
+                        # Создаем чек-лист
+                        new_cl = Checklist(
+                            name=ss.cl_add_form["name"],
+                            company_id=company_id,
+                            is_scored=ss.cl_add_form.get("is_scored", False),
+                            created_by=0,  # TODO: проставить текущего пользователя
+                            positions=assigned_positions,
+                        )
+                        db.add(new_cl)
+                        db.commit()
+
+                        # Создаем разделы и вопросы по порядку
+                        q_type_map = {
+                            "Да/Нет": "yesno",
+                            "Шкала (1-10)": "scale",
+                            "Короткий текст": "short_text",
+                            "Длинный текст": "long_text",
+                        }
+
+                        for s_order, s in enumerate(ss.cl_add_form.get("sections", []), 1):
+                            sec_obj = ChecklistSection(
+                                checklist_id=new_cl.id,
+                                title=(s.get("title") or f"Раздел {s_order}").strip(),
+                                description=(s.get("description") or None),
+                                order=s_order,
+                                is_required=bool(s.get("is_required")),
                             )
-                            if existing:
-                                st.warning("Такой чек-лист уже существует.")
-                            else:
-                                # Привязка должностей
-                                pos_ids = ss.cl_add_form["positions"]
-                                assigned_positions = (
-                                    db.query(Position).filter(Position.id.in_(pos_ids)).all()
-                                    if pos_ids else []
-                                )
+                            db.add(sec_obj)
+                            db.flush()
 
-                                # Создаём чек-лист
-                                new_cl = Checklist(
-                                    name=ss.cl_add_form["name"],
-                                    company_id=company_id,
-                                    is_scored=ss.cl_add_form["is_scored"],
-                                    created_by=0,  # TODO: текущий админ
-                                    positions=assigned_positions,
-                                )
-                                db.add(new_cl)
-                                db.commit()
-
-                                # Типы → внутренние коды БД
-                                q_type_map = {
-                                    "Да/Нет/Пропустить": "yesno",
-                                    "Шкала (1-10)": "scale",
-                                    "Короткий текст": "short_text",
-                                    "Длинный текст": "long_text",
-                                }
-
-                                # Вставка вопросов
-                                for order_idx, q in enumerate(ss.cl_add_form["questions"], 1):
-                                    db.add(
-                                        ChecklistQuestion(
-                                            checklist_id=new_cl.id,
-                                            order=order_idx,
-                                            text=q["text"],
-                                            type=q_type_map[q["type"]],
-                                            required=True,
-                                            weight=(int(q["weight"]) if q.get("weight") is not None else None),
-                                            require_photo=bool(q.get("require_photo")),
-                                            require_comment=bool(q.get("require_comment")),
-                                        )
+                            for q_order, q in enumerate(s.get("questions", []), 1):
+                                meta = {"min": 1, "max": 10} if q.get("type") == "Шкала (1-10)" else None
+                                db.add(
+                                    ChecklistQuestion(
+                                        checklist_id=new_cl.id,
+                                        section_id=sec_obj.id,
+                                        order=q_order,
+                                        text=q.get("text"),
+                                        type=q_type_map[q.get("type")],
+                                        required=bool(q.get("required", True)),
+                                        weight=(int(q.get("weight")) if q.get("weight") is not None else None),
+                                        require_photo=bool(q.get("require_photo")),
+                                        require_comment=bool(q.get("require_comment")),
+                                        meta=meta,
                                     )
-                                db.commit()
+                                )
 
-                                st.success("Чек-лист и вопросы успешно сохранены!")
-                                # Сброс мастера и nonce
-                                ss.cl_add_form = {
-                                    "name": "",
-                                    "is_scored": False,
-                                    "questions": [],
-                                    "positions": [],
-                                }
-                                ss.cl_add_step = 1
-                                ss.cl_add_nonce = 0
+                        db.commit()
+                        st.success("Чек-лист создан")
 
-                                # Если внутри модалки — закрываем и форсим обновление всей страницы
-                                if dialog_state_key:
-                                    ss[dialog_state_key] = False
-                                st.rerun()
+                        # Сброс мастера
+                        ss.cl_add_form = {"name": "", "is_scored": False, "positions": [], "sections": []}
+                        ss.cl_add_step = 1
+                        ss.active_section_idx = 0
+                        if dialog_state_key:
+                            ss[dialog_state_key] = False
+                        st.rerun()
 
-                        except IntegrityError as e:
-                            db.rollback()
-                            st.error("Ошибка при добавлении чек-листа")
-                            st.exception(e)
+                    except IntegrityError as e:
+                        db.rollback()
+                        st.error("Ошибка при сохранении чек-листа")
+                        st.exception(e)
+
     finally:
         db.close()
+

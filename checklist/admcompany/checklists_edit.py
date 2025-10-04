@@ -1,363 +1,472 @@
-import streamlit as st 
+# -*- coding: utf-8 -*-
+# checklist/admcompany/checklists_edit.py
+
+import streamlit as st
 import pandas as pd
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import joinedload
-from sqlalchemy.orm import Session
+from typing import Optional, List, Dict, Any
 
 from checklist.db.db import SessionLocal
-from checklist.db.models import Checklist, ChecklistQuestion, Position
-from checklist.admcompany.checklists_add import checklists_add_tab
-
-# Метки типов ответов
-_TYPE_LABELS = {
-    "yesno": "Да/Нет/Пропустить",
-    "scale": "Шкала (1–10)",
-    "short_text": "Короткий текст",
-    "long_text": "Длинный текст",
-}
-_TYPE_ORDER = ["yesno", "scale", "short_text", "long_text"]
+from checklist.db.models import (
+    Checklist,
+    ChecklistSection,
+    ChecklistQuestion,
+)
 
 
-def _type_label(code: str) -> str:
-    return _TYPE_LABELS.get(code, code or "—")
+QUESTION_TYPES = [
+    ("yesno", "Да/Нет"),
+    ("scale", "Шкала (1-10)"),
+    ("short_text", "Короткий текст"),
+    ("long_text", "Длинный текст"),
+]
 
 
-def _remember_selected_checklist(cl: Checklist):
-    """Запоминаем выбранный чек-лист в сессии."""
-    st.session_state["cl_edit_selected_id"] = cl.id
+# ----------------------------
+#   HELPERS
+# ----------------------------
+def _load_checklist(db, checklist_id: int) -> Optional[Checklist]:
+    return db.query(Checklist).get(checklist_id)
 
 
-def _remember_selected_question(q: ChecklistQuestion | None):
-    """Запоминаем выбранный вопрос в сессии (или None)."""
-    st.session_state["cl_edit_selected_qid"] = q.id if q else None
-
-
-def _selected_checklist_index(checklists: list[Checklist]) -> int:
-    """Вернуть индекс выбранного чек-листа по session_state, иначе 0."""
-    cid = st.session_state.get("cl_edit_selected_id")
-    if cid:
-        for i, cl in enumerate(checklists):
-            if cl.id == cid:
-                return i
-    return 0
-
-
-def _selected_question_index(questions: list[ChecklistQuestion]) -> int:
-    """Вернуть индекс выбранного вопроса по session_state, иначе 0."""
-    qid = st.session_state.get("cl_edit_selected_qid")
-    if qid:
-        for i, q in enumerate(questions):
-            if q.id == qid:
-                return i
-    return 0
-
-
-def _reorder_questions(db: Session, checklist_id: int):
-    """Переупорядочить вопросы после удаления, чтобы порядок был 1..N."""
-    qs = (
-        db.query(ChecklistQuestion)
-        .filter_by(checklist_id=checklist_id)
-        .order_by(ChecklistQuestion.order.asc(), ChecklistQuestion.id.asc())
+def _get_sections(db, checklist_id: int) -> List[ChecklistSection]:
+    return (
+        db.query(ChecklistSection)
+        .filter(ChecklistSection.checklist_id == checklist_id)
+        .order_by(ChecklistSection.order.asc())
         .all()
     )
-    changed = False
-    for idx, q in enumerate(qs, start=1):
-        if q.order != idx:
-            q.order = idx
-            changed = True
-    if changed:
-        db.commit()
 
 
-def _render_new_checklist_button(company_id: int):
-    """
-    Кнопка 'Новый чек-лист' с модалкой.
-    ВАЖНО: передаём dialog_state_key внутрь checklists_add_tab, чтобы
-    из формы добавления можно было:
-      - по кнопке «Сохранить» -> вызвать st.rerun() (и обновить эту вкладку),
-      - по своей кнопке «Закрыть» -> вызвать st.rerun() (и обновить эту вкладку).
-    """
-    _dialog = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
-
-    if _dialog:
-        @_dialog("Создать чек-лист")
-        def _add_checklist_dialog():
-            # Внутри формы добавления:
-            # - по успешному сохранению: st.rerun()
-            # - по своей кнопке «Закрыть»: st.rerun()
-            # (ключ "dlg_add_from_edit" используется только как маркер; закрытие делаем своей кнопкой)
-            checklists_add_tab(company_id, embedded=True, dialog_state_key="dlg_add_from_edit")
-
-        if st.button("🆕 Новый чек-лист", key="open_add_checklist_bottom", type="primary"):
-            _add_checklist_dialog()
-    else:
-        if st.button("🆕 Новый чек-лист", key="open_add_checklist_fallback_bottom", type="primary"):
-            st.info("Обнови Streamlit до 1.30+ для модального окна. Ниже показана форма добавления.")
-            st.markdown("---")
-            st.markdown("### Добавить чек-лист")
-            # Фолбэк: без модалки. Всё равно передаём dialog_state_key — внутри будет st.rerun().
-            checklists_add_tab(company_id, embedded=True, dialog_state_key="dlg_add_from_edit")
+def _get_section_questions(db, section_id: int) -> List[ChecklistQuestion]:
+    return (
+        db.query(ChecklistQuestion)
+        .filter(ChecklistQuestion.section_id == section_id)
+        .order_by(ChecklistQuestion.order.asc())
+        .all()
+    )
 
 
-def checklists_edit_tab(company_id: int):
-    db: Session = SessionLocal()
-    try:
-        st.subheader("Редактировать / Добавить чек-листы")
+def _next_order_for_section(db, section_id: int) -> int:
+    last = (
+        db.query(ChecklistQuestion.order)
+        .filter(ChecklistQuestion.section_id == section_id)
+        .order_by(ChecklistQuestion.order.desc())
+        .first()
+    )
+    return (last[0] + 1) if last else 1
 
-        # =========================
-        # ФИЛЬТР ПО ДОЛЖНОСТЯМ
-        # =========================
-        all_positions = (
-            db.query(Position)
-            .filter_by(company_id=company_id)
-            .order_by(Position.name.asc())
-            .all()
-        )
-        pos_options = {p.name: p.id for p in all_positions}
-        pos_names = list(pos_options.keys())
 
-        st.markdown("#### Фильтр по должностям")
-        sel_pos_names = st.multiselect(
-            "Должности (необязательно, множественный выбор)",
-            options=pos_names,
-            default=[],
-            key="cl_edit_pos_filter",
-        )
-        sel_pos_ids = {pos_options[n] for n in sel_pos_names} if sel_pos_names else set()
+def _next_order_for_sections(db, checklist_id: int) -> int:
+    last = (
+        db.query(ChecklistSection.order)
+        .filter(ChecklistSection.checklist_id == checklist_id)
+        .order_by(ChecklistSection.order.desc())
+        .first()
+    )
+    return (last[0] + 1) if last else 1
 
-        # =========================
-        # ВЫБОР ЧЕК-ЛИСТА
-        # =========================
-        q = (
-            db.query(Checklist)
-            .filter(Checklist.company_id == company_id)
-            .options(joinedload(Checklist.positions))
-            .order_by(Checklist.name.asc())
-        )
-        if sel_pos_ids:
-            q = q.join(Checklist.positions).filter(Position.id.in_(sel_pos_ids)).distinct()
 
-        checklists = q.all()
-        if not checklists:
-            st.info(
-                "Нет чек-листов (по фильтру должностей ничего не найдено)."
-                if sel_pos_ids
-                else "В компании пока нет чек-листов."
-            )
-            # Нижняя панель (одна кнопка «Новый чек-лист»)
-            st.markdown("---")
-            cols = st.columns([6, 2, 2, 2])  # для красивого выравнивания вправо
-            with cols[3]:
-                _render_new_checklist_button(company_id)
-            return
+def _reorder_sections_to(db, checklist_id: int, section_id: int, new_order: int):
+    sections = (
+        db.query(ChecklistSection)
+        .filter(ChecklistSection.checklist_id == checklist_id)
+        .order_by(ChecklistSection.order.asc())
+        .all()
+    )
+    if not sections:
+        return
+    target = next((s for s in sections if s.id == section_id), None)
+    if not target:
+        return
+    others = [s for s in sections if s.id != section_id]
+    pos = max(1, min(new_order, len(others) + 1))
+    others.insert(pos - 1, target)
+    for idx, s in enumerate(others, 1):
+        s.order = idx
+    db.commit()
 
-        # Подсчёт вопросов
-        cl_id_to_qcount = {
-            cl.id: db.query(ChecklistQuestion).filter_by(checklist_id=cl.id).count()
-            for cl in checklists
-        }
-        # Метки (для краткой инфы)
-        labels = [
-            f"{cl.name} — {'оцениваемый' if cl.is_scored else 'без оценки'} · вопросов: {cl_id_to_qcount.get(cl.id, 0)}"
-            for cl in checklists
-        ]
 
-        # Выбор чек-листа (стабильно удерживаем выбранный)
-        default_idx = _selected_checklist_index(checklists)
-        sel_idx = st.selectbox(
-            "Редактируемый чек-лист:",
-            options=list(range(len(checklists))),
-            format_func=lambda i: labels[i],
-            index=default_idx,
-            key="cl_edit_select_idx",
-        )
-        selected_cl: Checklist = checklists[sel_idx]
-        _remember_selected_checklist(selected_cl)
-
-        # =========================
-        # ТАБЛИЦА ВОПРОСОВ
-        # =========================
-        questions = (
+def _reorder_question_to(db, q: ChecklistQuestion, target_section_id: int, new_order: int):
+    # Compress orders in old section if moving
+    if q.section_id != target_section_id:
+        old = (
             db.query(ChecklistQuestion)
-            .filter_by(checklist_id=selected_cl.id)
+            .filter(ChecklistQuestion.section_id == q.section_id)
             .order_by(ChecklistQuestion.order.asc())
             .all()
         )
+        old = [i for i in old if i.id != q.id]
+        for idx, i in enumerate(old, 1):
+            i.order = idx
 
-        st.markdown("#### Вопросы чек-листа")
-        if questions:
-            rows = []
-            for qobj in questions:
-                rows.append(
-                    {
-                        "№": qobj.order,
-                        "Вопрос": qobj.text or "",
-                        "Тип ответа": _type_label(qobj.type),
-                        "Фото обяз.": "Да" if (qobj.require_photo or False) else "Нет",
-                        "Коммент обяз.": "Да" if (qobj.require_comment or False) else "Нет",
-                        "Вес": int(qobj.weight) if (qobj.weight is not None) else "",
-                    }
+    items = (
+        db.query(ChecklistQuestion)
+        .filter(ChecklistQuestion.section_id == target_section_id)
+        .order_by(ChecklistQuestion.order.asc())
+        .all()
+    )
+    if q.section_id == target_section_id:
+        items = [i for i in items if i.id != q.id]
+    pos = max(1, min(new_order, len(items) + 1))
+    q.section_id = target_section_id
+    items.insert(pos - 1, q)
+    for idx, i in enumerate(items, 1):
+        i.order = idx
+    db.commit()
+
+
+# ----------------------------
+#   SECTIONS CRUD (popovers)
+# ----------------------------
+def _add_section_popover(db, checklist_id: int):
+    with st.popover("Добавить раздел", use_container_width=True):
+        st.markdown("**Новый раздел**")
+        title = st.text_input("Название раздела", key="sec_add_title")
+        desc = st.text_area("Описание (опционально)", key="sec_add_desc")
+        is_req = st.checkbox("Обязательный раздел", value=False, key="sec_add_required")
+        if st.button("Сохранить раздел", type="primary", key="sec_add_save"):
+            try:
+                sec = ChecklistSection(
+                    checklist_id=checklist_id,
+                    title=(title or "").strip(),
+                    description=(desc or "").strip() or None,
+                    order=_next_order_for_sections(db, checklist_id),
+                    is_required=bool(is_req),
                 )
-            df = pd.DataFrame(
-                rows, columns=["№", "Вопрос", "Тип ответа", "Фото обяз.", "Коммент обяз.", "Вес"]
+                if not sec.title:
+                    raise ValueError("Введите название раздела")
+                db.add(sec)
+                db.commit()
+                st.success("Раздел добавлен")
+                st.rerun()
+            except Exception as exc:
+                db.rollback()
+                st.error(str(exc))
+
+
+def _edit_section_dialog(db, checklist_id: int):
+    with st.popover("Изменить раздел", use_container_width=True):
+        sections = _get_sections(db, checklist_id)
+        if not sections:
+            st.info("Сначала добавьте хотя бы один раздел.")
+            return
+        sel = st.selectbox(
+            "Раздел",
+            options=[f"{s.order}. {s.title}" for s in sections],
+            key="sec_edit_pick_in_popover",
+        )
+        ord_ = int(sel.split(".", 1)[0])
+        sec = next(s for s in sections if s.order == ord_)
+
+        st.markdown("**Редактирование раздела**")
+        title = st.text_input("Название раздела", value=sec.title, key=f"sec_ed_title_{sec.id}")
+        desc = st.text_area("Описание", value=sec.description or "", key=f"sec_ed_desc_{sec.id}")
+        is_req = st.checkbox("Обязательный раздел", value=bool(sec.is_required), key=f"sec_ed_required_{sec.id}")
+
+        max_order = len(sections)
+        new_order = st.number_input(
+            "Порядок",
+            min_value=1,
+            max_value=max_order,
+            value=int(sec.order),
+            key=f"sec_ed_order_{sec.id}",
+        )
+
+        c1, c4 = st.columns([1, 1])
+        with c1:
+            if st.button("Сохранить", type="primary", key=f"sec_ed_save_{sec.id}"):
+                try:
+                    sec.title = (title or "").strip()
+                    sec.description = (desc or "").strip() or None
+                    sec.is_required = bool(is_req)
+                    if not sec.title:
+                        raise ValueError("Введите название раздела")
+                    db.commit()
+                    if int(new_order) != sec.order:
+                        _reorder_sections_to(db, sec.checklist_id, sec.id, int(new_order))
+                    st.success("Сохранено")
+                    st.rerun()
+                except Exception as exc:
+                    db.rollback()
+                    st.error(str(exc))
+        with c4:
+            confirm = st.checkbox("Подтвердить удаление", key=f"sec_del_confirm_{sec.id}")
+            if st.button("Удалить", type="secondary", disabled=not confirm, key=f"sec_del_{sec.id}"):
+                try:
+                    first = (
+                        db.query(ChecklistSection)
+                        .filter(ChecklistSection.checklist_id == sec.checklist_id, ChecklistSection.id != sec.id)
+                        .order_by(ChecklistSection.order.asc())
+                        .first()
+                    )
+                    if first:
+                        db.query(ChecklistQuestion).filter(ChecklistQuestion.section_id == sec.id).update(
+                            {ChecklistQuestion.section_id: first.id}
+                        )
+                    db.delete(sec)
+                    db.commit()
+                    st.success("Удалено")
+                    st.rerun()
+                except Exception as exc:
+                    db.rollback()
+                    st.error(str(exc))
+
+
+# ----------------------------
+#   QUESTIONS (popovers)
+# ----------------------------
+def _add_question_popover(db, section: ChecklistSection, is_scored: bool):
+    with st.popover("Добавить вопрос", use_container_width=True):
+        answer_types = ["Короткий текст", "Длинный текст", "Да/Нет", "Шкала (1-10)"]
+        if is_scored:
+            answer_types = ["Да/Нет", "Шкала (1-10)"]
+        with st.form(f"add_question_form_{section.id}", clear_on_submit=True):
+            q_text = st.text_input("Текст вопроса", key=f"q_text_{section.id}")
+            q_type = st.selectbox("Тип ответа", options=answer_types, key=f"q_type_{section.id}")
+            q_weight = None
+            if is_scored and q_type in ("Да/Нет", "Шкала (1-10)"):
+                q_weight = st.number_input("Вес (1-10)", min_value=1, max_value=10, value=1, key=f"q_weight_{section.id}")
+            req_photo = st.checkbox("Требовать фото", value=False, key=f"q_req_photo_{section.id}")
+            req_comment = st.checkbox("Требовать комментарий", value=False, key=f"q_req_comment_{section.id}")
+            q_required = st.checkbox("Обязательный вопрос?", value=True, key=f"q_required_{section.id}")
+            submit = st.form_submit_button("Добавить")
+        if submit:
+            try:
+                txt = (q_text or "").strip()
+                if not txt:
+                    st.warning("Введите текст вопроса")
+                    return
+                type_map = {
+                    "Да/Нет": "yesno",
+                    "Шкала (1-10)": "scale",
+                    "Короткий текст": "short_text",
+                    "Длинный текст": "long_text",
+                }
+                meta = {"min": 1, "max": 10} if q_type == "Шкала (1-10)" else None
+                db.add(
+                    ChecklistQuestion(
+                        checklist_id=section.checklist_id,
+                        section_id=section.id,
+                        order=_next_order_for_section(db, section.id),
+                        text=txt,
+                        type=type_map[q_type],
+                        required=bool(q_required),
+                        weight=(int(q_weight) if q_weight is not None else None),
+                        require_photo=bool(req_photo),
+                        require_comment=bool(req_comment),
+                        meta=meta,
+                    )
+                )
+                db.commit()
+                st.success("Вопрос добавлен")
+                st.rerun()
+            except Exception as exc:
+                db.rollback()
+                st.error(str(exc))
+
+
+def _edit_question_popover(db, section: ChecklistSection, sections_for_move: List[ChecklistSection]):
+    with st.popover("Редактировать вопрос", use_container_width=True):
+        qs = _get_section_questions(db, section.id)
+        if not qs:
+            st.info("В этом разделе пока нет вопросов.")
+            return
+        q_sel = st.selectbox(
+            "Вопрос",
+            options=[f"{q.order}. {q.text[:40]}{'...' if len(q.text)>40 else ''}" for q in qs],
+            key=f"q_pick_{section.id}",
+        )
+        q_ord = int(q_sel.split(".", 1)[0])
+        q = next(q for q in qs if q.order == q_ord)
+
+        st.markdown("**Редактирование вопроса**")
+        text_val = st.text_area("Текст вопроса", value=q.text, key=f"q_ed_text_{q.id}")
+
+        qtype_label = next(lbl for k, lbl in QUESTION_TYPES if k == q.type)
+        qtype_new_label = st.selectbox(
+            "Тип ответа",
+            options=[lbl for _, lbl in QUESTION_TYPES],
+            index=[lbl for _, lbl in QUESTION_TYPES].index(qtype_label),
+            key=f"q_ed_type_lbl_{q.id}",
+        )
+        type_key = next(k for k, lbl in QUESTION_TYPES if lbl == qtype_new_label)
+
+        required = st.checkbox("Обязательный", value=bool(q.required), key=f"q_ed_req_{q.id}")
+        require_photo = st.checkbox("Требовать фото", value=bool(q.require_photo), key=f"q_ed_photo_{q.id}")
+        require_comment = st.checkbox("Требовать комментарий", value=bool(q.require_comment), key=f"q_ed_comm_{q.id}")
+
+        meta: Dict[str, Any] = {}
+        if type_key == "scale":
+            cur_min = (q.meta or {}).get("min", 1)
+            cur_max = (q.meta or {}).get("max", 10)
+            c1, c2 = st.columns(2)
+            with c1:
+                meta_min = st.number_input("Мин", value=int(cur_min), step=1, key=f"q_ed_meta_min_{q.id}")
+            with c2:
+                meta_max = st.number_input("Макс", value=int(cur_max), step=1, key=f"q_ed_meta_max_{q.id}")
+            if meta_max < meta_min:
+                st.warning("Макс не может быть меньше Мин.")
+            meta = {"min": int(meta_min), "max": int(meta_max)}
+
+        move_to_title = st.selectbox(
+            "Раздел",
+            options=[s.title for s in sections_for_move],
+            index=[s.id for s in sections_for_move].index(q.section_id) if q.section_id else 0,
+            key=f"q_ed_move_to_{q.id}",
+        )
+        move_to_id = next(s.id for s in sections_for_move if s.title == move_to_title)
+
+        # Порядок в целевом разделе
+        target_count = (
+            db.query(ChecklistQuestion)
+            .filter(ChecklistQuestion.section_id == move_to_id)
+            .count()
+        )
+        max_order = target_count if move_to_id == q.section_id else (target_count + 1)
+        default_order = q.order if move_to_id == q.section_id else (target_count + 1)
+        new_order = st.number_input(
+            "Порядок",
+            min_value=1,
+            max_value=max(1, int(max_order)),
+            value=int(default_order),
+            key=f"q_ed_order_{q.id}",
+        )
+
+        c1, c4 = st.columns([1, 1])
+        with c1:
+            if st.button("Сохранить", type="primary", key=f"q_ed_save_{q.id}"):
+                try:
+                    q.text = (text_val or "").strip()
+                    q.type = type_key
+                    q.required = bool(required)
+                    q.require_photo = bool(require_photo)
+                    q.require_comment = bool(require_comment)
+                    q.meta = meta or None
+                    if not q.text:
+                        raise ValueError("Введите текст вопроса")
+                    db.commit()
+                    _reorder_question_to(db, q, move_to_id, int(new_order))
+                    st.success("Сохранено")
+                    st.rerun()
+                except Exception as exc:
+                    db.rollback()
+                    st.error(str(exc))
+        with c4:
+            confirm = st.checkbox("Подтвердить удаление", key=f"q_del_confirm_{q.id}")
+            if st.button("Удалить", type="secondary", disabled=not confirm, key=f"q_del_{q.id}"):
+                try:
+                    db.delete(q)
+                    db.commit()
+                    st.success("Удалено")
+                    st.rerun()
+                except Exception as exc:
+                    db.rollback()
+                    st.error(str(exc))
+
+
+# ----------------------------
+#   ENTRY (selected checklist)
+# ----------------------------
+def checklists_edit(checklist_id: int):
+    db = SessionLocal()
+    try:
+        ck = _load_checklist(db, checklist_id)
+        if not ck:
+            st.error("Чек-лист не найден")
+            return
+
+        st.markdown(f"**Чек-лист:** {ck.name}")
+        st.caption(f"ID: {ck.id} • Оценочный: {'Да' if ck.is_scored else 'Нет'}")
+        tabs = st.tabs(["Разделы", "Вопросы"])
+
+        # -------- Разделы --------
+        with tabs[0]:
+            sections = _get_sections(db, ck.id)
+            if not sections:
+                st.info("Разделов пока нет. Добавьте раздел ниже.")
+            else:
+                rows = [
+                    {"Порядок": s.order, "Название": s.title, "Обязательный": "Да" if s.is_required else "Нет"}
+                    for s in sections
+                ]
+                st.dataframe(pd.DataFrame(rows).sort_values(by="Порядок"), use_container_width=True, hide_index=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if sections:
+                    _edit_section_dialog(db, ck.id)
+            with c2:
+                _add_section_popover(db, ck.id)
+
+        # -------- Вопросы --------
+        with tabs[1]:
+            sections = _get_sections(db, ck.id)
+            if not sections:
+                st.info("Сначала добавьте хотя бы один раздел.")
+                return
+
+            chosen = st.selectbox(
+                "Раздел",
+                options=[f"{s.order}. {s.title}" for s in sections],
+                key="q_section_select",
             )
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.info("В этом чек-листе пока нет вопросов.")
+            ord_ = int(chosen.split(".", 1)[0])
+            active_sec = next(s for s in sections if s.order == ord_)
 
-        st.markdown("---")
+            qs = _get_section_questions(db, active_sec.id)
+            if qs:
+                q_rows = [
+                    {
+                        "Порядок": q.order,
+                        "Текст": q.text,
+                        "Тип": next(lbl for k, lbl in QUESTION_TYPES if k == q.type),
+                        "Обязательный": "Да" if q.required else "Нет",
+                        "Фото": "Да" if q.require_photo else "Нет",
+                        "Комментарий": "Да" if q.require_comment else "Нет",
+                    }
+                    for q in qs
+                ]
+                st.dataframe(pd.DataFrame(q_rows).sort_values(by="Порядок"), use_container_width=True, hide_index=True)
+            else:
+                st.info("Вопросов пока нет. Добавьте вопрос ниже.")
 
-        # =========================
-        # НИЖНЯЯ ПАНЕЛЬ: 3 КНОПКИ
-        # =========================
-        btn_cols = st.columns([6, 2, 2, 2])  # выравниваем вправо
-        # 1) ✏️ Редактировать вопрос (popover)
-        with btn_cols[1]:
-            with st.popover("✏️ Редактировать вопрос", use_container_width=True):
-                if not questions:
-                    st.info("Вопросов нет. Сначала добавьте новый вопрос или создайте чек-лист.")
-                else:
-                    # Выбор вопроса (удерживаем выбранный)
-                    q_labels = [f"{q.order}. {q.text[:60]}" for q in questions]
-                    default_q_idx = _selected_question_index(questions)
-                    sel_q_idx = st.selectbox(
-                        "Выберите вопрос:",
-                        options=list(range(len(questions))),
-                        format_func=lambda i: q_labels[i],
-                        index=default_q_idx,
-                        key="cl_edit_q_select_idx",
-                    )
-                    q_edit: ChecklistQuestion = questions[sel_q_idx]
-                    _remember_selected_question(q_edit)
-
-                    # Поля редактирования
-                    new_text = st.text_input(
-                        "Текст вопроса", value=q_edit.text or "", key=f"q_text_{q_edit.id}"
-                    )
-                    new_type = st.selectbox(
-                        "Тип ответа",
-                        options=_TYPE_ORDER,
-                        format_func=_type_label,
-                        index=_TYPE_ORDER.index(q_edit.type) if q_edit.type in _TYPE_ORDER else 0,
-                        key=f"q_type_{q_edit.id}",
-                    )
-                    new_weight = st.number_input(
-                        "Вес (1–10, если применимо)",
-                        min_value=1,
-                        max_value=10,
-                        value=int(q_edit.weight) if q_edit.weight is not None else 1,
-                        key=f"q_weight_{q_edit.id}",
-                    )
-                    c_photo, c_comm = st.columns(2)
-                    with c_photo:
-                        req_photo = st.checkbox(
-                            "Обязательное фото", value=bool(q_edit.require_photo), key=f"q_req_photo_{q_edit.id}"
-                        )
-                    with c_comm:
-                        req_comment = st.checkbox(
-                            "Обязательный комментарий", value=bool(q_edit.require_comment), key=f"q_req_comm_{q_edit.id}"
-                        )
-
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        if st.button("💾 Сохранить изменения", key=f"save_q_{q_edit.id}"):
-                            try:
-                                q_edit.text = new_text
-                                q_edit.type = new_type
-                                q_edit.weight = int(new_weight) if new_weight else None
-                                q_edit.require_photo = bool(req_photo)
-                                q_edit.require_comment = bool(req_comment)
-                                db.commit()
-                                # Удерживаем текущий выбор
-                                _remember_selected_checklist(selected_cl)
-                                _remember_selected_question(q_edit)
-                                st.success("Вопрос обновлён")
-                                st.rerun()
-                            except IntegrityError as e:
-                                db.rollback()
-                                st.error("Ошибка при сохранении вопроса")
-                                st.exception(e)
-                    with col_b:
-                        if st.button("🗑️ Удалить вопрос", key=f"del_q_{q_edit.id}"):
-                            try:
-                                # вычисляем соседа для выбора после удаления
-                                next_q_id = None
-                                if len(questions) > 1:
-                                    cur_i = sel_q_idx
-                                    if cur_i < len(questions) - 1:
-                                        next_q_id = questions[cur_i + 1].id
-                                    else:
-                                        next_q_id = questions[cur_i - 1].id
-                                db.delete(q_edit)
-                                db.commit()
-                                _reorder_questions(db, selected_cl.id)
-                                # Удерживаем текущий чек-лист и новый выбранный вопрос
-                                _remember_selected_checklist(selected_cl)
-                                if next_q_id:
-                                    nq = db.query(ChecklistQuestion).filter_by(id=next_q_id).first()
-                                    _remember_selected_question(nq)
-                                else:
-                                    _remember_selected_question(None)
-
-                                st.success("Вопрос удалён")
-                                st.rerun()
-                            except IntegrityError as e:
-                                db.rollback()
-                                st.error("Ошибка при удалении вопроса")
-                                st.exception(e)
-
-        # 2) ➕ Добавить вопрос (popover)
-        with btn_cols[2]:
-            with st.popover("➕ Добавить вопрос", use_container_width=True):
-                new_q_text = st.text_input("Текст вопроса", key="add_q_text_pop")
-                new_q_type = st.selectbox(
-                    "Тип ответа", options=_TYPE_ORDER, format_func=_type_label, index=0, key="add_q_type_pop"
-                )
-                new_q_weight = st.number_input("Вес (1–10, если применимо)", min_value=1, max_value=10, value=1, key="add_q_weight_pop")
-                c1, c2 = st.columns(2)
-                with c1:
-                    new_req_photo = st.checkbox("Обязательное фото", value=False, key="add_q_req_photo_pop")
-                with c2:
-                    new_req_comment = st.checkbox("Обязательный комментарий", value=False, key="add_q_req_comment_pop")
-
-                if st.button("✅ Добавить", key="add_q_submit_pop", type="primary"):
-                    if not new_q_text.strip():
-                        st.error("Введите текст вопроса")
-                    else:
-                        try:
-                            # order = последний + 1
-                            last = (
-                                db.query(ChecklistQuestion)
-                                .filter_by(checklist_id=selected_cl.id)
-                                .order_by(ChecklistQuestion.order.desc())
-                                .first()
-                            )
-                            new_order = (last.order + 1) if last else 1
-                            new_q = ChecklistQuestion(
-                                checklist_id=selected_cl.id,
-                                order=new_order,
-                                text=new_q_text.strip(),
-                                type=new_q_type,
-                                required=True,
-                                weight=int(new_q_weight) if new_q_weight else None,
-                                require_photo=bool(new_req_photo),
-                                require_comment=bool(new_req_comment),
-                            )
-                            db.add(new_q)
-                            db.commit()
-                            # Удерживаем выбор чек-листа и выбрать только что созданный вопрос
-                            _remember_selected_checklist(selected_cl)
-                            _remember_selected_question(new_q)
-                            st.success("Вопрос добавлен")
-                            st.rerun()
-                        except IntegrityError as e:
-                            db.rollback()
-                            st.error("Ошибка при добавлении вопроса")
-                            st.exception(e)
-
-        # 3) 🆕 Новый чек-лист (модалка)
-        with btn_cols[3]:
-            _render_new_checklist_button(company_id)
+            cqa1, cqa2 = st.columns(2)
+            with cqa1:
+                _add_question_popover(db, active_sec, bool(ck.is_scored))
+            with cqa2:
+                if qs:
+                    _edit_question_popover(db, active_sec, sections)
 
     finally:
         db.close()
+
+
+# ----------------------------
+#   TAB WRAPPER (select checklist)
+# ----------------------------
+def checklists_edit_tab(company_id: int):
+    db = SessionLocal()
+    try:
+        checklists = (
+            db.query(Checklist)
+            .filter(Checklist.company_id == company_id)
+            .order_by(Checklist.name.asc())
+            .all()
+        )
+
+        if not checklists:
+            st.info("Чек-листов пока нет.")
+            return
+
+        selected = st.selectbox(
+            "Выберите чек-лист для редактирования",
+            options=checklists,
+            format_func=lambda c: getattr(c, "name", str(c)),
+            key="ck_edit_tab_select",
+        )
+
+        if selected:
+            checklists_edit(selected.id)
+    finally:
+        db.close()
+

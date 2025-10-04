@@ -1,4 +1,4 @@
-from checklist.db.models import Base
+from checklist.db.base import Base
 from sqlalchemy import create_engine
 import os
 from dotenv import load_dotenv
